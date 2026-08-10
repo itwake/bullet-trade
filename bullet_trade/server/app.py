@@ -14,6 +14,7 @@ import ipaddress
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bullet_trade.core.globals import log
@@ -30,7 +31,7 @@ from .adapters.base import (
 from .config import ServerConfig
 from .session import ClientSession
 from .tick import TickSubscriptionManager
-from .write_audit import WriteAuditStore
+from .write_audit import WriteAuditError, WriteAuditStore
 
 BROKER_ACTION_METHODS = {
     "account": "get_account_info",
@@ -89,7 +90,15 @@ class ServerApplication:
         self._idempotency_lock = asyncio.Lock()
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
-        self.write_audit = WriteAuditStore(config.write_audit_db_path)
+        self.write_audit: Optional[WriteAuditStore] = None
+        self._audit_ready = False
+        audit_path = str(config.write_audit_db_path or "").strip()
+        if audit_path and Path(audit_path).is_absolute():
+            try:
+                self.write_audit = WriteAuditStore(audit_path)
+                self._audit_ready = True
+            except Exception:
+                self.write_audit = None
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
                 account_key = ctx.config.key or "default"
@@ -135,7 +144,8 @@ class ServerApplication:
                 await self.adapters.broker_adapter.stop()
             except Exception:
                 pass
-        self.write_audit.close()
+        if self.write_audit is not None:
+            self.write_audit.close()
 
     def active_features(self) -> List[str]:
         """返回当前配置启用的功能列表。
@@ -222,6 +232,7 @@ class ServerApplication:
     ) -> Dict:
         if not action:
             raise ValueError("缺少 action 字段")
+        await self._audit_broker_request(action)
         if action == "data.subscribe":
             if not self.tick_manager:
                 raise RuntimeError("数据服务未启用")
@@ -240,7 +251,13 @@ class ServerApplication:
         if action == "admin.audit_receipt":
             if not session.is_authenticated:
                 raise PermissionError("authenticated session required")
-            return self.write_audit.receipt(self.config.token, payload.get("nonce"))
+            if not self._audit_ready or self.write_audit is None:
+                raise WriteAuditError("write audit is unavailable")
+            try:
+                return self.write_audit.receipt(self.config.token, payload.get("nonce"))
+            except WriteAuditError:
+                self._audit_ready = False
+                raise
         if action == "admin.print_account":
             return await self._admin_print_account(session, payload)
         if action.startswith("data."):
@@ -249,19 +266,29 @@ class ServerApplication:
             return await self._dispatch_broker(session, action.split(".", 1)[1], payload)
         raise ValueError(f"未知 action: {action}")
 
-    def prepare_request(self, action: Optional[str]) -> None:
-        """Durably audit broker writes and reject unknown broker actions."""
+    async def _audit_broker_request(self, action: str) -> None:
+        """Commit a broker write attempt without blocking the event loop."""
 
-        normalized = str(action or "")
+        normalized = str(action)
         category = BROKER_WRITE_CATEGORIES.get(normalized)
-        if category is not None:
-            self.write_audit.record(category)
-            return
-        if normalized.startswith("broker."):
+        unknown = False
+        if category is None and normalized.startswith("broker."):
             method = normalized.split(".", 1)[1]
             if method not in BROKER_ACTION_METHODS:
-                self.write_audit.record("unknown")
-                raise UnknownBrokerActionError("unknown broker action")
+                category = "unknown"
+                unknown = True
+        if category is None:
+            return
+        if not self._audit_ready or self.write_audit is None:
+            raise WriteAuditError("write audit is unavailable")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self.write_audit.record, category)
+        except WriteAuditError:
+            self._audit_ready = False
+            raise
+        if unknown:
+            raise UnknownBrokerActionError("unknown broker action")
 
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:
         if not self.adapters.data_adapter:
@@ -625,6 +652,7 @@ class ServerApplication:
     def _health_snapshot(self) -> Dict:
         value = {
             "process_alive": True,
+            "audit_ready": self._audit_ready,
             "uptime_seconds": max(0.0, time.time() - self._created_at),
             "sessions": len(self._sessions),
             "accounts": [ctx.config.key for ctx in self.router.list_accounts()],

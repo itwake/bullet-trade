@@ -9,7 +9,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 AUDIT_CATEGORIES = ("place", "cancel", "unknown")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
@@ -50,12 +50,57 @@ def sign_receipt(token: str, receipt: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def verify_receipt(token: str, envelope: Dict[str, Any]) -> bool:
+def verify_receipt(token: str, envelope: Dict[str, Any], expected_nonce: str) -> bool:
     """Verify an ``admin.audit_receipt`` response without exposing the token."""
 
+    if not isinstance(envelope, dict) or set(envelope) != {
+        "receipt",
+        "signature_algorithm",
+        "signature",
+    }:
+        return False
+    if envelope.get("signature_algorithm") != "HMAC-SHA256":
+        return False
     receipt = envelope.get("receipt")
     signature = envelope.get("signature")
-    if not isinstance(receipt, dict) or not isinstance(signature, str):
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt)
+        != {
+            "schema_version",
+            "store_id",
+            "boot_sequence",
+            "boot_id",
+            "global_seq",
+            "counters",
+            "issued_at",
+            "nonce",
+        }
+        or not isinstance(signature, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", signature)
+        or type(receipt.get("schema_version")) is not int
+        or receipt.get("schema_version") != 1
+        or not isinstance(expected_nonce, str)
+        or not _NONCE_RE.fullmatch(expected_nonce)
+        or receipt.get("nonce") != expected_nonce
+        or not re.fullmatch(r"[0-9a-f]{32}", str(receipt.get("store_id") or ""))
+        or not re.fullmatch(r"[0-9a-f]{32}", str(receipt.get("boot_id") or ""))
+        or type(receipt.get("boot_sequence")) is not int
+        or int(receipt["boot_sequence"]) <= 0
+        or type(receipt.get("global_seq")) is not int
+        or int(receipt["global_seq"]) < 0
+        or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z",
+            str(receipt.get("issued_at") or ""),
+        )
+    ):
+        return False
+    counters = receipt.get("counters")
+    if not isinstance(counters, dict) or set(counters) != set(AUDIT_CATEGORIES):
+        return False
+    if any(type(counters.get(key)) is not int or counters[key] < 0 for key in AUDIT_CATEGORIES):
+        return False
+    if sum(counters.values()) != receipt["global_seq"]:
         return False
     return hmac.compare_digest(sign_receipt(token, receipt), signature)
 
@@ -65,9 +110,10 @@ class WriteAuditStore:
 
     def __init__(self, path: str):
         raw_path = str(path or "").strip()
-        if not raw_path or raw_path == ":memory:":
-            raise WriteAuditError("persistent write-audit database path is required")
-        self.path = str(Path(raw_path).expanduser().resolve())
+        candidate = Path(raw_path).expanduser() if raw_path else Path()
+        if not raw_path or raw_path == ":memory:" or not candidate.is_absolute():
+            raise WriteAuditError("absolute persistent write-audit database path is required")
+        self.path = str(candidate.resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
@@ -126,6 +172,11 @@ class WriteAuditStore:
             now = _utc_now()
             row = self._conn.execute("SELECT * FROM audit_state WHERE singleton = 1").fetchone()
             if row is None:
+                event_count = int(
+                    self._conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+                )
+                if event_count:
+                    raise WriteAuditError("write-audit integrity check failed")
                 store_id = uuid.uuid4().hex
                 boot_sequence = 1
                 self._conn.execute(
@@ -141,6 +192,7 @@ class WriteAuditStore:
             else:
                 if int(row["schema_version"]) != 1:
                     raise WriteAuditError("unsupported write-audit schema")
+                self._validate_state_in_transaction(row)
                 store_id = str(row["store_id"])
                 boot_sequence = int(row["boot_sequence"]) + 1
                 self._conn.execute(
@@ -165,11 +217,10 @@ class WriteAuditStore:
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT global_seq FROM audit_state WHERE singleton = 1"
-                ).fetchone()
+                row = self._conn.execute("SELECT * FROM audit_state WHERE singleton = 1").fetchone()
                 if row is None:
                     raise WriteAuditError("write-audit state is missing")
+                self._validate_state_in_transaction(row)
                 seq = int(row["global_seq"]) + 1
                 occurred_at = _utc_now()
                 self._conn.execute(
@@ -201,34 +252,18 @@ class WriteAuditStore:
             raise AuditReceiptError("nonce must be 16-128 URL-safe characters")
         with self._lock:
             try:
+                self._conn.execute("BEGIN")
                 row = self._conn.execute("SELECT * FROM audit_state WHERE singleton = 1").fetchone()
-                aggregate = self._conn.execute("""
-                    SELECT
-                        COUNT(*) AS event_count,
-                        COALESCE(MAX(seq), 0) AS max_seq,
-                        COALESCE(SUM(category = 'place'), 0) AS place_count,
-                        COALESCE(SUM(category = 'cancel'), 0) AS cancel_count,
-                        COALESCE(SUM(category = 'unknown'), 0) AS unknown_count
-                    FROM audit_events
-                    """).fetchone()
+                if row is not None:
+                    self._validate_state_in_transaction(row)
+                self._conn.commit()
             except Exception as exc:
+                self._rollback_quietly()
+                if isinstance(exc, WriteAuditError):
+                    raise
                 raise WriteAuditError("write-audit read failed") from exc
-        if row is None or aggregate is None:
+        if row is None:
             raise WriteAuditError("write-audit state is missing")
-        expected = (
-            int(row["global_seq"]),
-            int(row["place_count"]),
-            int(row["cancel_count"]),
-            int(row["unknown_count"]),
-        )
-        observed = (
-            int(aggregate["event_count"]),
-            int(aggregate["place_count"]),
-            int(aggregate["cancel_count"]),
-            int(aggregate["unknown_count"]),
-        )
-        if expected != observed or int(aggregate["max_seq"]) != int(row["global_seq"]):
-            raise WriteAuditError("write-audit integrity check failed")
         receipt = {
             "schema_version": 1,
             "store_id": str(row["store_id"]),
@@ -258,6 +293,33 @@ class WriteAuditStore:
             self._conn.rollback()
         except Exception:
             pass
+
+    def _validate_state_in_transaction(self, row: sqlite3.Row) -> None:
+        aggregate = self._conn.execute("""
+            SELECT
+                COUNT(*) AS event_count,
+                COALESCE(MAX(seq), 0) AS max_seq,
+                COALESCE(SUM(category = 'place'), 0) AS place_count,
+                COALESCE(SUM(category = 'cancel'), 0) AS cancel_count,
+                COALESCE(SUM(category = 'unknown'), 0) AS unknown_count
+            FROM audit_events
+            """).fetchone()
+        if aggregate is None:
+            raise WriteAuditError("write-audit integrity check failed")
+        expected = (
+            int(row["global_seq"]),
+            int(row["place_count"]),
+            int(row["cancel_count"]),
+            int(row["unknown_count"]),
+        )
+        observed = (
+            int(aggregate["event_count"]),
+            int(aggregate["place_count"]),
+            int(aggregate["cancel_count"]),
+            int(aggregate["unknown_count"]),
+        )
+        if expected != observed or int(aggregate["max_seq"]) != int(row["global_seq"]):
+            raise WriteAuditError("write-audit integrity check failed")
 
 
 def _utc_now() -> str:

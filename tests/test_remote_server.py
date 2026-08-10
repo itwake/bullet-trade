@@ -42,7 +42,7 @@ def _ensure_current_event_loop() -> asyncio.AbstractEventLoop:
 
 
 @pytest.fixture(scope="module")
-def stub_server():
+def stub_server(tmp_path_factory):
     port = 59321
     config = ServerConfig(
         server_type="stub",
@@ -52,6 +52,7 @@ def stub_server():
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
+        write_audit_db_path=str(tmp_path_factory.mktemp("stub-audit") / "audit.sqlite3"),
     )
     _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
@@ -310,7 +311,7 @@ def test_stub_server_market_order_uses_market_price_type(stub_server):
         conn.close()
 
 
-def test_stub_server_filled_scenario_updates_trades_positions_and_account():
+def test_stub_server_filled_scenario_updates_trades_positions_and_account(tmp_path):
     config = ServerConfig(
         server_type="stub",
         listen="127.0.0.1",
@@ -319,6 +320,7 @@ def test_stub_server_filled_scenario_updates_trades_positions_and_account():
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
+        write_audit_db_path=str(tmp_path / "audit.sqlite3"),
     )
     _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
@@ -363,7 +365,7 @@ def test_stub_server_filled_scenario_updates_trades_positions_and_account():
         thread.join(timeout=5)
 
 
-def test_stub_server_cancel_risk_controls(monkeypatch):
+def test_stub_server_cancel_risk_controls(monkeypatch, tmp_path):
     monkeypatch.setenv("MAX_DAILY_CANCELS", "1")
     monkeypatch.setenv("MIN_CANCEL_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("MAX_CANCEL_PER_ORDER", "1")
@@ -377,6 +379,7 @@ def test_stub_server_cancel_risk_controls(monkeypatch):
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
         order_risk_enabled=True,
+        write_audit_db_path=str(tmp_path / "audit.sqlite3"),
     )
     _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
@@ -408,7 +411,7 @@ def test_stub_server_cancel_risk_controls(monkeypatch):
         thread.join(timeout=5)
 
 
-def test_stub_server_rejects_buy_below_min_order_value(monkeypatch):
+def test_stub_server_rejects_buy_below_min_order_value(monkeypatch, tmp_path):
     """测试服务端下单风控会拒绝低于最小金额的买入委托。"""
     monkeypatch.setenv("MIN_BUY_ORDER_VALUE", "2000")
 
@@ -421,6 +424,7 @@ def test_stub_server_rejects_buy_below_min_order_value(monkeypatch):
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
         order_risk_enabled=True,
+        write_audit_db_path=str(tmp_path / "audit.sqlite3"),
     )
     _ensure_current_event_loop()
     router = AccountRouter(config.accounts)

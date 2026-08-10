@@ -4,14 +4,18 @@ The QMT relay durably records every authenticated broker write attempt before re
 dispatch. The journal is fail-closed: if the synchronous SQLite commit fails, the
 broker adapter is not called.
 
-Configure an absolute, access-controlled path for production:
+Configure an explicit absolute, access-controlled path:
 
 ```dotenv
 QMT_SERVER_WRITE_AUDIT_DB=D:\quant\state\qmt-write-audit.sqlite3
 ```
 
-The default is `qmt-write-audit.sqlite3` in the server working directory. SQLite runs
-in WAL mode with `synchronous=FULL`. The journal contains only an event sequence,
+There is no default path and relative paths are rejected. Missing, relative,
+unwritable, or corrupt audit storage does not take down read RPCs or `admin.health`,
+but all `place`, `cancel`, and unknown `broker.*` actions fail with
+`AUDIT_UNAVAILABLE` before adapter dispatch. `admin.health` exposes only the boolean
+`audit_ready`; it does not expose the path or initialization error. SQLite runs in
+WAL mode with `synchronous=FULL`. The journal contains only an event sequence,
 category (`place`, `cancel`, or `unknown`), boot identifiers, and UTC timestamps. It
 does not contain tokens, accounts, symbols, quantities, prices, request IDs, order
 IDs, or request payloads.
@@ -34,6 +38,10 @@ contains the persistent `store_id`, current `boot_sequence` and `boot_id`, globa
 sequence, the three cumulative counters, UTC issue time, and the caller nonce.
 
 Verification is deterministic:
+
+Before verification, require the expected nonce to equal the receipt nonce and
+strictly validate the documented envelope, algorithm, receipt, and counter fields.
+Then:
 
 1. Encode `receipt` as UTF-8 JSON with sorted keys, ASCII escaping, no whitespace,
    and no NaN values.

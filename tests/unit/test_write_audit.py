@@ -3,16 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Tuple
 
 import pytest
 
 from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import ServerConfig
-from bullet_trade.server.session import ClientSession
 from bullet_trade.server.write_audit import (
     AuditReceiptError,
     WriteAuditError,
@@ -22,43 +22,44 @@ from bullet_trade.server.write_audit import (
 )
 
 
-class _Writer:
+class _BrokerAdapter:
     def __init__(self) -> None:
-        self.messages = []
-        self._closing = False
+        self.calls = []
 
-    def is_closing(self) -> bool:
-        return self._closing
+    async def get_account_info(self, _account) -> Dict[str, Any]:
+        self.calls.append("account")
+        return {"dtype": "dict", "value": {"ok": True}}
 
-    def write(self, data: bytes) -> None:
-        self.messages.append(data)
+    async def place_order(self, _account, _payload) -> Dict[str, Any]:
+        self.calls.append("place")
+        return {"order_id": "not-audited-data"}
 
-    async def drain(self) -> None:
-        return None
-
-    def close(self) -> None:
-        self._closing = True
-
-    async def wait_closed(self) -> None:
-        return None
+    async def cancel_order(self, _account, _order_id) -> Dict[str, Any]:
+        self.calls.append("cancel")
+        return {"value": True}
 
 
-class _OrderingApp:
-    def __init__(self, error: Optional[Exception] = None) -> None:
-        self.events = []
-        self.error = error
+def _app(path: str) -> Tuple[ServerApplication, _BrokerAdapter]:
+    broker = _BrokerAdapter()
+    config = ServerConfig(token="token", write_audit_db_path=path)
+    router = SimpleNamespace(
+        list_accounts=lambda: [],
+        get=lambda _key: SimpleNamespace(config=SimpleNamespace(key="default")),
+    )
+    app = ServerApplication(
+        config=config,
+        router=router,
+        adapters=SimpleNamespace(data_adapter=None, broker_adapter=broker),
+    )
+    return app, broker
 
-    def prepare_request(self, action: str) -> None:
-        self.events.append(("audit", action))
-        if self.error:
-            raise self.error
 
-    async def handle_request(self, session: ClientSession, action: str, payload: Dict) -> Dict:
-        self.events.append(("adapter", action))
-        return {"ok": True}
-
-    def log_access(self, *args: Any, **kwargs: Any) -> None:
-        return None
+def _session(authenticated: bool = True):
+    return SimpleNamespace(
+        is_authenticated=authenticated,
+        account_key=None,
+        sub_account_id=None,
+    )
 
 
 def test_store_persists_identity_sequence_counters_and_boots(tmp_path: Path) -> None:
@@ -80,8 +81,8 @@ def test_store_persists_identity_sequence_counters_and_boots(tmp_path: Path) -> 
     assert after["boot_id"] != before["boot_id"]
     assert after["global_seq"] == 3
     assert after["counters"] == {"place": 1, "cancel": 1, "unknown": 1}
-    assert verify_receipt("token-one", receipt2)
-    assert not verify_receipt("token-two", receipt2)
+    assert verify_receipt("token-one", receipt2, "nonce-qrstuvwxyz123456")
+    assert not verify_receipt("token-two", receipt2, "nonce-qrstuvwxyz123456")
     second.close()
 
 
@@ -122,7 +123,7 @@ def test_receipt_is_canonical_nonce_bound_and_contains_no_secrets(tmp_path: Path
     ).encode("utf-8")
     tampered = json.loads(json.dumps(envelope))
     tampered["receipt"]["nonce"] = "different-nonce-123456"
-    assert not verify_receipt(token, tampered)
+    assert not verify_receipt(token, tampered, "client-nonce-abcdef012345")
     assert token.encode() not in path.read_bytes()
     assert "account" not in json.dumps(envelope)
     assert "symbol" not in json.dumps(envelope)
@@ -161,115 +162,149 @@ def test_receipt_fails_closed_on_counter_corruption(tmp_path: Path) -> None:
     store.close()
 
 
-def test_broker_action_allowlist_audits_unknown_before_dispatch(tmp_path: Path) -> None:
-    config = ServerConfig(token="token", write_audit_db_path=str(tmp_path / "audit.sqlite3"))
-    app = ServerApplication(
-        config=config,
-        router=SimpleNamespace(list_accounts=lambda: []),
-        adapters=SimpleNamespace(
-            data_adapter=None, broker_adapter=SimpleNamespace(cleanup=lambda: None)
-        ),
-    )
+@pytest.mark.asyncio
+async def test_direct_handle_audits_writes_and_unknown_before_dispatch(tmp_path: Path) -> None:
+    app, broker = _app(str(tmp_path / "audit.sqlite3"))
+    await app.handle_request(_session(), "broker.place_order", {"side": "BUY"})
+    await app.handle_request(_session(), "broker.cancel_order", {"order_id": "private"})
     with pytest.raises(ValueError, match="unknown broker action"):
-        app.prepare_request("broker.cleanup")
-    receipt = app.write_audit.receipt("token", "unknown-action-nonce-01")
-    assert receipt["receipt"]["counters"] == {"place": 0, "cancel": 0, "unknown": 1}
+        await app.handle_request(_session(), "broker.cleanup", {})
+
+    assert broker.calls == ["place", "cancel"]
+    assert app.write_audit is not None
+    envelope = app.write_audit.receipt("token", "direct-handle-nonce-001")
+    assert envelope["receipt"]["counters"] == {"place": 1, "cancel": 1, "unknown": 1}
     app.write_audit.close()
 
 
 @pytest.mark.asyncio
-async def test_authenticated_admin_receipt_and_read_actions_do_not_increment(
-    tmp_path: Path,
+@pytest.mark.parametrize("configured_path", ["", "relative-audit.sqlite3"])
+async def test_missing_or_relative_audit_keeps_reads_but_rejects_writes(
+    configured_path: str,
 ) -> None:
-    config = ServerConfig(token="token", write_audit_db_path=str(tmp_path / "audit.sqlite3"))
-    app = ServerApplication(
-        config=config,
-        router=SimpleNamespace(list_accounts=lambda: []),
-        adapters=SimpleNamespace(data_adapter=None, broker_adapter=None),
-    )
-    for action in (
-        "broker.account",
-        "broker.positions",
-        "broker.orders",
-        "broker.trades",
-        "broker.order_status",
+    app, broker = _app(configured_path)
+    assert app.write_audit is None
+    if configured_path:
+        assert not Path(configured_path).exists()
+    health = await app.handle_request(_session(), "admin.health", {})
+    assert health["value"]["audit_ready"] is False
+    assert [key for key in health["value"] if key.startswith("audit_")] == ["audit_ready"]
+    account = await app.handle_request(_session(), "broker.account", {})
+    assert account["value"]["ok"] is True
+
+    for action, payload in (
+        ("broker.place_order", {"side": "BUY"}),
+        ("broker.cancel_order", {"order_id": "private"}),
+        ("broker.cleanup", {}),
     ):
-        app.prepare_request(action)
-    session = SimpleNamespace(is_authenticated=True)
-    envelope = await app.handle_request(
-        session,
-        "admin.audit_receipt",
-        {"nonce": "authenticated-nonce-0001"},
+        with pytest.raises(WriteAuditError) as exc_info:
+            await app.handle_request(_session(), action, payload)
+        assert exc_info.value.code == "AUDIT_UNAVAILABLE"
+    with pytest.raises(WriteAuditError):
+        await app.handle_request(
+            _session(), "admin.audit_receipt", {"nonce": "unavailable-nonce-0001"}
+        )
+    assert broker.calls == ["account"]
+
+
+@pytest.mark.asyncio
+async def test_unwritable_or_corrupt_audit_keeps_server_readable(tmp_path: Path) -> None:
+    blocking_file = tmp_path / "not-a-directory"
+    blocking_file.write_text("x", encoding="utf-8")
+    corrupt_file = tmp_path / "corrupt.sqlite3"
+    corrupt_file.write_bytes(b"not sqlite")
+
+    for path in (blocking_file / "audit.sqlite3", corrupt_file):
+        app, broker = _app(str(path))
+        assert app.write_audit is None
+        assert (await app.handle_request(_session(), "admin.health", {}))["value"][
+            "audit_ready"
+        ] is False
+        await app.handle_request(_session(), "broker.account", {})
+        with pytest.raises(WriteAuditError):
+            await app.handle_request(_session(), "broker.place_order", {"side": "BUY"})
+        assert broker.calls == ["account"]
+
+
+@pytest.mark.asyncio
+async def test_deleted_event_blocks_next_write_before_adapter(tmp_path: Path) -> None:
+    app, broker = _app(str(tmp_path / "audit.sqlite3"))
+    await app.handle_request(_session(), "broker.place_order", {"side": "BUY"})
+    assert app.write_audit is not None
+    app.write_audit._conn.execute("DELETE FROM audit_events WHERE seq = 1")
+
+    with pytest.raises(WriteAuditError, match="integrity check failed"):
+        await app.handle_request(_session(), "broker.place_order", {"side": "BUY"})
+    assert broker.calls == ["place"]
+    assert (await app.handle_request(_session(), "admin.health", {}))["value"][
+        "audit_ready"
+    ] is False
+    app.write_audit.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_chain_is_rejected_during_restart_but_reads_work(tmp_path: Path) -> None:
+    path = tmp_path / "audit.sqlite3"
+    store = WriteAuditStore(str(path))
+    store.record("place")
+    store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM audit_events WHERE seq = 1")
+        connection.commit()
+    with pytest.raises(WriteAuditError, match="integrity check failed"):
+        WriteAuditStore(str(path))
+    app, broker = _app(str(path))
+    assert app.write_audit is None
+    await app.handle_request(_session(), "broker.account", {})
+    with pytest.raises(WriteAuditError):
+        await app.handle_request(_session(), "broker.cancel_order", {"order_id": "private"})
+    assert broker.calls == ["account"]
+
+
+@pytest.mark.asyncio
+async def test_write_audit_runs_off_event_loop(tmp_path: Path, monkeypatch) -> None:
+    app, broker = _app(str(tmp_path / "audit.sqlite3"))
+    assert app.write_audit is not None
+    original_record = app.write_audit.record
+
+    def slow_record(category: str):
+        time.sleep(0.1)
+        return original_record(category)
+
+    monkeypatch.setattr(app.write_audit, "record", slow_record)
+    write_task = asyncio.create_task(
+        app.handle_request(_session(), "broker.place_order", {"side": "BUY"})
     )
-    assert envelope["receipt"]["global_seq"] == 0
-    assert verify_receipt("token", envelope)
+    await asyncio.sleep(0.01)
+    assert not write_task.done()
+    assert (await app.handle_request(_session(), "admin.health", {}))["value"][
+        "audit_ready"
+    ] is True
+    await write_task
+    assert broker.calls == ["place"]
+    app.write_audit.close()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_receipt_is_strict_and_nonce_bound(tmp_path: Path) -> None:
+    app, _broker = _app(str(tmp_path / "audit.sqlite3"))
+    nonce = "authenticated-nonce-0001"
+    envelope = await app.handle_request(_session(), "admin.audit_receipt", {"nonce": nonce})
+    assert verify_receipt("token", envelope, nonce)
+    assert not verify_receipt("token", envelope, "replayed-nonce-0000002")
+    assert not verify_receipt("wrong-token", envelope, nonce)
+
+    wrong_algorithm = json.loads(json.dumps(envelope))
+    wrong_algorithm["signature_algorithm"] = "HMAC-SHA1"
+    assert not verify_receipt("token", wrong_algorithm, nonce)
+    extra_field = json.loads(json.dumps(envelope))
+    extra_field["receipt"]["unexpected"] = True
+    assert not verify_receipt("token", extra_field, nonce)
     with pytest.raises(PermissionError):
         await app.handle_request(
-            SimpleNamespace(is_authenticated=False),
+            _session(False),
             "admin.audit_receipt",
             {"nonce": "unauthenticated-nonce-01"},
         )
+    assert app.write_audit is not None
     app.write_audit.close()
-
-
-@pytest.mark.asyncio
-async def test_session_commits_audit_before_handle_request(monkeypatch) -> None:
-    app = _OrderingApp()
-    writer = _Writer()
-    session = ClientSession(app, asyncio.StreamReader(), writer, "127.0.0.1")  # type: ignore[arg-type]
-    session._active = True
-    messages = iter(
-        [
-            {
-                "type": "request",
-                "id": "not-persisted",
-                "action": "broker.place_order",
-                "payload": {"symbol": "secret", "quantity": 100},
-            }
-        ]
-    )
-
-    async def _read(_reader):
-        try:
-            return next(messages)
-        except StopIteration:
-            session._active = False
-            raise asyncio.IncompleteReadError(b"", 4)
-
-    monkeypatch.setattr("bullet_trade.server.session.read_message", _read)
-    with pytest.raises(asyncio.IncompleteReadError):
-        await session._loop()
-    assert app.events == [
-        ("audit", "broker.place_order"),
-        ("adapter", "broker.place_order"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_session_audit_failure_makes_zero_adapter_calls(monkeypatch) -> None:
-    app = _OrderingApp(WriteAuditError("write-audit commit failed"))
-    writer = _Writer()
-    session = ClientSession(app, asyncio.StreamReader(), writer, "127.0.0.1")  # type: ignore[arg-type]
-    session._active = True
-    messages = iter(
-        [
-            {
-                "type": "request",
-                "id": "not-persisted",
-                "action": "broker.cancel_order",
-                "payload": {"order_id": "secret"},
-            }
-        ]
-    )
-
-    async def _read(_reader):
-        try:
-            return next(messages)
-        except StopIteration:
-            session._active = False
-            raise asyncio.IncompleteReadError(b"", 4)
-
-    monkeypatch.setattr("bullet_trade.server.session.read_message", _read)
-    with pytest.raises(asyncio.IncompleteReadError):
-        await session._loop()
-    assert app.events == [("audit", "broker.cancel_order")]

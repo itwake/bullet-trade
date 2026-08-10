@@ -142,8 +142,6 @@ class ClientSession:
             self._current_request = action
             start = time.time()
             try:
-                # Intentionally synchronous: FULL commit before any adapter call.
-                self.app.prepare_request(action)
                 request_timeout = self._request_timeout_for(action, payload)
                 # 使用 asyncio.wait_for 添加超时控制
                 result = await asyncio.wait_for(
@@ -275,5 +273,3 @@ class ServerApplication:  # pragma: no cover
     async def handle_request(
         self, session: ClientSession, action: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]: ...
-
-    def prepare_request(self, action: Optional[str]) -> None: ...
