@@ -60,6 +60,7 @@ class ServerConfig:
     access_log_enabled: bool = True
     order_risk_enabled: bool = False
     idempotency_ttl_seconds: int = 300
+    write_audit_db_path: str = "qmt-write-audit.sqlite3"
 
 
 def _split_items(raw: Optional[str]) -> List[str]:
@@ -182,8 +183,11 @@ def build_server_config(args) -> ServerConfig:
         access_log_enabled = True if flag is None else bool(flag)
     order_risk_enabled = get_env_bool("QMT_SERVER_ORDER_RISK_ENABLED", False)
     idempotency_ttl_seconds = get_env_int("QMT_SERVER_IDEMPOTENCY_TTL_SECONDS", 300)
+    write_audit_db_path = get_env("QMT_SERVER_WRITE_AUDIT_DB", "qmt-write-audit.sqlite3")
 
-    accounts_map = _parse_accounts(getattr(args, "accounts", None) or get_env("QMT_SERVER_ACCOUNTS"))
+    accounts_map = _parse_accounts(
+        getattr(args, "accounts", None) or get_env("QMT_SERVER_ACCOUNTS")
+    )
     default_account_id = get_env("QMT_ACCOUNT_ID")
     default_account_type = get_env("QMT_ACCOUNT_TYPE", "stock")
     default_data_path = get_env("QMT_DATA_PATH")
@@ -235,5 +239,6 @@ def build_server_config(args) -> ServerConfig:
         access_log_enabled=bool(access_log_enabled),
         order_risk_enabled=bool(order_risk_enabled),
         idempotency_ttl_seconds=max(0, int(idempotency_ttl_seconds)),
+        write_audit_db_path=str(write_audit_db_path or ""),
     )
     return cfg

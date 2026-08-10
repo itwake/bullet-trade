@@ -28,7 +28,13 @@ class ClientSession:
         "QMT_SERVER_PLACE_ORDER_TIMEOUT_MARGIN",
     )
 
-    def __init__(self, app: "ServerApplication", reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peername: str):
+    def __init__(
+        self,
+        app: "ServerApplication",
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        peername: str,
+    ):
         self.app = app
         self.reader = reader
         self.writer = writer
@@ -41,6 +47,10 @@ class ClientSession:
         self._send_lock = asyncio.Lock()
         self._last_ping = time.time()
         self._current_request: Optional[str] = None  # 当前正在处理的请求 action
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._active
 
     async def run(self) -> None:
         try:
@@ -67,7 +77,15 @@ class ClientSession:
 
     @staticmethod
     def _is_expected_disconnect(exc: BaseException) -> bool:
-        if isinstance(exc, (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+        if isinstance(
+            exc,
+            (
+                asyncio.IncompleteReadError,
+                ConnectionResetError,
+                BrokenPipeError,
+                ConnectionAbortedError,
+            ),
+        ):
             return True
         if not isinstance(exc, OSError):
             return False
@@ -102,7 +120,9 @@ class ClientSession:
             raise
         await write_message(self.writer, ack)
         self._active = True
-        log.info(f"[SESSION] {self.session_id} 握手成功, peer={self.peername}, account={self.account_key or '-'}")
+        log.info(
+            f"[SESSION] {self.session_id} 握手成功, peer={self.peername}, account={self.account_key or '-'}"
+        )
 
     async def _loop(self) -> None:
         while self._active:
@@ -112,7 +132,9 @@ class ClientSession:
                 await self._send_pong(message)
                 continue
             if msg_type != "request":
-                await self._send_error(message.get("id"), "UNSUPPORTED", f"不支持的消息类型 {msg_type}")
+                await self._send_error(
+                    message.get("id"), "UNSUPPORTED", f"不支持的消息类型 {msg_type}"
+                )
                 continue
             request_id = message.get("id")
             action = message.get("action")
@@ -120,6 +142,8 @@ class ClientSession:
             self._current_request = action
             start = time.time()
             try:
+                # Intentionally synchronous: FULL commit before any adapter call.
+                self.app.prepare_request(action)
                 request_timeout = self._request_timeout_for(action, payload)
                 # 使用 asyncio.wait_for 添加超时控制
                 result = await asyncio.wait_for(
@@ -130,11 +154,15 @@ class ClientSession:
                 elapsed = time.time() - start
                 error_msg = f"请求超时（>{request_timeout}s）"
                 log.warning(f"[SESSION] {self.session_id} 请求 {action} 超时, 耗时={elapsed:.1f}s")
-                self.app.log_access(self, action, payload, "timeout", elapsed, error_msg, request_id=request_id)
+                self.app.log_access(
+                    self, action, payload, "timeout", elapsed, error_msg, request_id=request_id
+                )
                 await self._send_error(request_id, "REQUEST_TIMEOUT", error_msg)
             except Exception as exc:
                 elapsed = time.time() - start
-                self.app.log_access(self, action, payload, "error", elapsed, str(exc), request_id=request_id)
+                self.app.log_access(
+                    self, action, payload, "error", elapsed, str(exc), request_id=request_id
+                )
                 await self._send_error(request_id, getattr(exc, "code", "REQUEST_FAILED"), str(exc))
             else:
                 elapsed = time.time() - start
@@ -244,4 +272,8 @@ class ServerApplication:  # pragma: no cover
 
     async def unregister_session(self, session: ClientSession) -> None: ...
 
-    async def handle_request(self, session: ClientSession, action: str, payload: Dict[str, Any]) -> Dict[str, Any]: ...
+    async def handle_request(
+        self, session: ClientSession, action: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]: ...
+
+    def prepare_request(self, action: Optional[str]) -> None: ...

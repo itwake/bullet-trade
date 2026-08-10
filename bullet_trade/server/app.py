@@ -10,8 +10,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import ipaddress
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -20,10 +20,35 @@ from bullet_trade.core.globals import log
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.utils.portfolio_printer import render_account_overview
 
-from .adapters.base import AccountRouter, AdapterBundle, AccountContext, SubAccountConfig, VirtualAccountManager
+from .adapters.base import (
+    AccountContext,
+    AccountRouter,
+    AdapterBundle,
+    SubAccountConfig,
+    VirtualAccountManager,
+)
 from .config import ServerConfig
 from .session import ClientSession
 from .tick import TickSubscriptionManager
+from .write_audit import WriteAuditStore
+
+BROKER_ACTION_METHODS = {
+    "account": "get_account_info",
+    "positions": "get_positions",
+    "orders": "list_orders",
+    "trades": "list_trades",
+    "order_status": "get_order_status",
+    "place_order": "place_order",
+    "cancel_order": "cancel_order",
+}
+BROKER_WRITE_CATEGORIES = {
+    "broker.place_order": "place",
+    "broker.cancel_order": "cancel",
+}
+
+
+class UnknownBrokerActionError(ValueError):
+    code = "UNKNOWN_BROKER_ACTION"
 
 
 @dataclass
@@ -64,6 +89,7 @@ class ServerApplication:
         self._idempotency_lock = asyncio.Lock()
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
+        self.write_audit = WriteAuditStore(config.write_audit_db_path)
         if self.config.order_risk_enabled:
             for ctx in self.router.list_accounts():
                 account_key = ctx.config.key or "default"
@@ -73,8 +99,14 @@ class ServerApplication:
     async def start(self) -> None:
         self._ensure_runtime_events()
         await self._start_components()
-        self._server = await asyncio.start_server(self._handle_client, self.config.listen, self.config.port)
-        host = self._server.sockets[0].getsockname() if self._server.sockets else (self.config.listen, self.config.port)
+        self._server = await asyncio.start_server(
+            self._handle_client, self.config.listen, self.config.port
+        )
+        host = (
+            self._server.sockets[0].getsockname()
+            if self._server.sockets
+            else (self.config.listen, self.config.port)
+        )
         log.info(f"QMT server listening on {host}")
         assert self._started is not None
         self._started.set()
@@ -103,6 +135,7 @@ class ServerApplication:
                 await self.adapters.broker_adapter.stop()
             except Exception:
                 pass
+        self.write_audit.close()
 
     def active_features(self) -> List[str]:
         """返回当前配置启用的功能列表。
@@ -184,7 +217,9 @@ class ServerApplication:
         else:
             log.info(base)
 
-    async def handle_request(self, session: ClientSession, action: Optional[str], payload: Dict) -> Dict:
+    async def handle_request(
+        self, session: ClientSession, action: Optional[str], payload: Dict
+    ) -> Dict:
         if not action:
             raise ValueError("缺少 action 字段")
         if action == "data.subscribe":
@@ -202,6 +237,10 @@ class ServerApplication:
             return await self.tick_manager.unsubscribe(session, None)
         if action == "admin.health":
             return self._health_snapshot()
+        if action == "admin.audit_receipt":
+            if not session.is_authenticated:
+                raise PermissionError("authenticated session required")
+            return self.write_audit.receipt(self.config.token, payload.get("nonce"))
         if action == "admin.print_account":
             return await self._admin_print_account(session, payload)
         if action.startswith("data."):
@@ -209,6 +248,20 @@ class ServerApplication:
         if action.startswith("broker."):
             return await self._dispatch_broker(session, action.split(".", 1)[1], payload)
         raise ValueError(f"未知 action: {action}")
+
+    def prepare_request(self, action: Optional[str]) -> None:
+        """Durably audit broker writes and reject unknown broker actions."""
+
+        normalized = str(action or "")
+        category = BROKER_WRITE_CATEGORIES.get(normalized)
+        if category is not None:
+            self.write_audit.record(category)
+            return
+        if normalized.startswith("broker."):
+            method = normalized.split(".", 1)[1]
+            if method not in BROKER_ACTION_METHODS:
+                self.write_audit.record("unknown")
+                raise UnknownBrokerActionError("unknown broker action")
 
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:
         if not self.adapters.data_adapter:
@@ -222,7 +275,9 @@ class ServerApplication:
                 return await snapshot_fn(payload)
             tick_fn = getattr(self.adapters.data_adapter, "get_current_tick", None)
             if tick_fn:
-                security = payload.get("security") or payload.get("stock") or payload.get("stockcode")
+                security = (
+                    payload.get("security") or payload.get("stock") or payload.get("stockcode")
+                )
                 return await tick_fn(security)
             raise ValueError("数据接口 current_tick 未实现")
         fn = getattr(self.adapters.data_adapter, method, None)
@@ -240,35 +295,23 @@ class ServerApplication:
         resolved_key, sub_cfg = self.virtual_accounts.resolve(account_key, sub_account_id)
         if sub_account_id and "sub_account_id" not in payload:
             payload["sub_account_id"] = (
-                sub_cfg.sub_account_id
-                if sub_cfg
-                else str(sub_account_id).split("@", 1)[0]
+                sub_cfg.sub_account_id if sub_cfg else str(sub_account_id).split("@", 1)[0]
             )
         ctx = self.router.get(resolved_key)
         if method == "place_order":
-            cached_result = await self._lookup_idempotent_place_result(resolved_key, sub_cfg, payload)
+            cached_result = await self._lookup_idempotent_place_result(
+                resolved_key, sub_cfg, payload
+            )
             if cached_result is not None:
                 return cached_result
         if method == "place_order":
             await self._maybe_reject_when_paused(payload)
             await self._maybe_fill_price(payload)
             await self.virtual_accounts.ensure_within_limit(sub_cfg, _estimate_order_value(payload))
-        impl = method
+        impl = BROKER_ACTION_METHODS.get(method)
+        if impl is None:
+            raise ValueError("unknown broker action")
         fn = getattr(self.adapters.broker_adapter, impl, None)
-        if fn is None:
-            aliases = {
-                "account": "get_account_info",
-                "positions": "get_positions",
-                "orders": "list_orders",
-                "trades": "list_trades",
-                "order_status": "get_order_status",
-                "place_order": "place_order",
-                "cancel_order": "cancel_order",
-            }
-            alias = aliases.get(method)
-            if alias:
-                impl = alias
-                fn = getattr(self.adapters.broker_adapter, impl, None)
         if not fn:
             raise ValueError(f"券商接口 {method} 未实现")
         args = self._build_broker_args(impl, ctx, payload)
@@ -466,9 +509,13 @@ class ServerApplication:
                     snapshot = None
             price = None
             if isinstance(snapshot, dict):
-                price = snapshot.get("last_price") or snapshot.get("lastPrice") or snapshot.get("price")
+                price = (
+                    snapshot.get("last_price") or snapshot.get("lastPrice") or snapshot.get("price")
+                )
             if price is None and callable(getattr(data_adapter, "get_history", None)):
-                hist = await data_adapter.get_history({"security": security, "count": 1, "frequency": "1m"})
+                hist = await data_adapter.get_history(
+                    {"security": security, "count": 1, "frequency": "1m"}
+                )
                 records = hist.get("records") if isinstance(hist, dict) else None
                 if records:
                     last = records[-1]
@@ -523,7 +570,9 @@ class ServerApplication:
             log.warning(msg + "（仅警告，不阻塞委托）")
             payload.setdefault("meta", {})["paused_warning"] = msg
 
-    def _build_broker_args(self, method: str, ctx: AccountContext, payload: Optional[Dict]) -> Tuple:
+    def _build_broker_args(
+        self, method: str, ctx: AccountContext, payload: Optional[Dict]
+    ) -> Tuple:
         payload = payload or {}
         if method in ("get_account_info", "get_positions"):
             return (ctx,)
@@ -547,7 +596,9 @@ class ServerApplication:
             return (ctx, order_id)
         return (ctx, payload)
 
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         peer = writer.get_extra_info("peername")
         address = peer[0] if isinstance(peer, (list, tuple)) else str(peer)
         log.info(f"[CONN] 新连接: {address}, 当前活跃会话数: {len(self._sessions)}")
@@ -585,7 +636,9 @@ class ServerApplication:
             backend_type = qmt_status.get("backend_type") if isinstance(qmt_status, dict) else None
             if backend_type:
                 value["backend_type"] = backend_type
-            big_qmt_gateway = qmt_status.get("big_qmt_gateway") if isinstance(qmt_status, dict) else None
+            big_qmt_gateway = (
+                qmt_status.get("big_qmt_gateway") if isinstance(qmt_status, dict) else None
+            )
             if big_qmt_gateway is not None:
                 value["big_qmt_gateway"] = big_qmt_gateway
         return {

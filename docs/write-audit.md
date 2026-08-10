@@ -1,0 +1,46 @@
+# Broker write-attempt audit
+
+The QMT relay durably records every authenticated broker write attempt before request
+dispatch. The journal is fail-closed: if the synchronous SQLite commit fails, the
+broker adapter is not called.
+
+Configure an absolute, access-controlled path for production:
+
+```dotenv
+QMT_SERVER_WRITE_AUDIT_DB=D:\quant\state\qmt-write-audit.sqlite3
+```
+
+The default is `qmt-write-audit.sqlite3` in the server working directory. SQLite runs
+in WAL mode with `synchronous=FULL`. The journal contains only an event sequence,
+category (`place`, `cancel`, or `unknown`), boot identifiers, and UTC timestamps. It
+does not contain tokens, accounts, symbols, quantities, prices, request IDs, order
+IDs, or request payloads.
+
+Broker RPCs use an explicit allowlist: `account`, `positions`, `orders`, `trades`,
+`order_status`, `place_order`, and `cancel_order`. Any other `broker.*` action is
+durably counted as `unknown` and rejected before adapter dispatch.
+
+## Authenticated receipt
+
+After the normal token handshake, request `admin.audit_receipt` with a fresh
+16–128-character URL-safe nonce:
+
+```json
+{"action":"admin.audit_receipt","payload":{"nonce":"collector-20260811-084500-a1b2c3"}}
+```
+
+The response contains `receipt`, `signature_algorithm`, and `signature`. The receipt
+contains the persistent `store_id`, current `boot_sequence` and `boot_id`, global
+sequence, the three cumulative counters, UTC issue time, and the caller nonce.
+
+Verification is deterministic:
+
+1. Encode `receipt` as UTF-8 JSON with sorted keys, ASCII escaping, no whitespace,
+   and no NaN values.
+2. Derive the signing key as
+   `HMAC-SHA256(token, "bullet-trade/write-audit/receipt-key/v1")`.
+3. Verify the hexadecimal signature over
+   `"bullet-trade/write-audit/receipt/v1\\0" + canonical_receipt_bytes`.
+
+The nonce binds a receipt to the collector challenge. The token is never stored in
+the audit database or returned in the receipt.
