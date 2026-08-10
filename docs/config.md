@@ -258,6 +258,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
 | `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 下单幂等缓存窗口秒数，避免重试导致重复下单。 |
+| `QMT_SERVER_WRITE_AUDIT_DB` | 空 | Broker 写尝试审计 SQLite 的绝对受限路径；缺失、相对或不可用时读接口保持可用，所有 Broker 写请求 fail-closed。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
 

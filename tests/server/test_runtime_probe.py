@@ -30,7 +30,7 @@ def _run_loop(loop: asyncio.AbstractEventLoop, app: ServerApplication) -> None:
 
 
 @pytest.fixture
-def seeded_stub_server():
+def seeded_stub_server(tmp_path: Path):
     port = 59341
     config = ServerConfig(
         server_type="stub",
@@ -40,6 +40,7 @@ def seeded_stub_server():
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
+        write_audit_db_path=str(tmp_path / "audit.sqlite3"),
     )
     _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
@@ -194,8 +195,22 @@ def test_runtime_probe_inspect_only_with_stub(seeded_stub_server, tmp_path: Path
     assert step_map["broker.trades"]["status"] == "ok"
     assert "last_price" in report["observed_contracts"]["snapshot_keys"]
     assert "symbol" in report["observed_contracts"]["tick_event_keys"]
-    assert report["observed_contracts"]["minute_history_columns"] == ["close", "high", "low", "money", "open", "volume"]
-    assert report["observed_contracts"]["daily_history_columns"] == ["close", "high", "low", "money", "open", "volume"]
+    assert report["observed_contracts"]["minute_history_columns"] == [
+        "close",
+        "high",
+        "low",
+        "money",
+        "open",
+        "volume",
+    ]
+    assert report["observed_contracts"]["daily_history_columns"] == [
+        "close",
+        "high",
+        "low",
+        "money",
+        "open",
+        "volume",
+    ]
     assert "available_cash" in report["observed_contracts"]["account_keys"]
     assert "positions" in report["observed_contracts"]["account_keys"]
     assert "raw_status" in report["observed_contracts"]["order_keys"]
@@ -231,12 +246,25 @@ def test_runtime_probe_trade_smoke_with_stub(seeded_stub_server, tmp_path: Path)
     assert step_map["broker.limit_buy_cancel"]["status"] == "ok"
     assert step_map["broker.market_buy_cleanup"]["status"] == "ok"
     assert "order_id" in report["observed_contracts"]["order_keys"]
-    limit_payload = json.loads((output_dir / "raw" / "15_broker_limit_buy_cancel.json").read_text(encoding="utf-8"))
-    market_payload = json.loads((output_dir / "raw" / "16_broker_market_buy_cleanup.json").read_text(encoding="utf-8"))
+    limit_payload = json.loads(
+        (output_dir / "raw" / "15_broker_limit_buy_cancel.json").read_text(encoding="utf-8")
+    )
+    market_payload = json.loads(
+        (output_dir / "raw" / "16_broker_market_buy_cleanup.json").read_text(encoding="utf-8")
+    )
     assert "cancel_response" in limit_payload
     assert limit_payload["cancel_response"]["timed_out"] is False
-    assert limit_payload["live_snapshot"]["high_limit"] > limit_payload["live_snapshot"]["last_price"]
-    assert limit_payload["live_snapshot"]["low_limit"] < limit_payload["live_snapshot"]["last_price"]
+    assert (
+        limit_payload["live_snapshot"]["high_limit"] > limit_payload["live_snapshot"]["last_price"]
+    )
+    assert (
+        limit_payload["live_snapshot"]["low_limit"] < limit_payload["live_snapshot"]["last_price"]
+    )
     assert "requested_protect_price" in market_payload
-    assert market_payload["live_snapshot"]["high_limit"] > market_payload["live_snapshot"]["last_price"]
-    assert market_payload["live_snapshot"]["low_limit"] < market_payload["live_snapshot"]["last_price"]
+    assert (
+        market_payload["live_snapshot"]["high_limit"]
+        > market_payload["live_snapshot"]["last_price"]
+    )
+    assert (
+        market_payload["live_snapshot"]["low_limit"] < market_payload["live_snapshot"]["last_price"]
+    )

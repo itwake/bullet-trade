@@ -27,6 +27,7 @@ nav:
   - Tick 行情指南: tick.md
   - 交易支撑: trade-support.md
   - QMT 服务配置: qmt-server.md
+  - Broker write-attempt audit: write-audit.md
   - 大 QMT 服务向导: big-qmt-server.md
   - API 文档: api.md
   - 数据源:
