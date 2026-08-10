@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
+from filelock import FileLock, Timeout
+
 AUDIT_CATEGORIES = ("place", "cancel", "unknown")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9._~-]{16,128}$")
 _KEY_DOMAIN = b"bullet-trade/write-audit/receipt-key/v1"
@@ -116,22 +118,39 @@ class WriteAuditStore:
         self.path = str(candidate.resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(
-            self.path,
-            timeout=30.0,
-            isolation_level=None,
-            check_same_thread=False,
+        self._process_lock = FileLock(
+            f"{self.path}.lock",
+            timeout=0,
+            thread_local=False,
         )
-        self._conn.row_factory = sqlite3.Row
+        self._closed = False
+        try:
+            self._process_lock.acquire(timeout=0)
+        except Timeout as exc:
+            raise WriteAuditError("write-audit database is already in use") from exc
+        except Exception as exc:
+            raise WriteAuditError("write-audit process lock is unavailable") from exc
         self.boot_id = uuid.uuid4().hex
         self.store_id = ""
         self.boot_sequence = 0
         try:
+            self._conn = sqlite3.connect(
+                self.path,
+                timeout=30.0,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            self._conn.row_factory = sqlite3.Row
             with self._lock:
                 self._configure()
                 self._initialize()
         except Exception as exc:
-            self._conn.close()
+            connection = getattr(self, "_conn", None)
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                self._process_lock.release()
             if isinstance(exc, WriteAuditError):
                 raise
             raise WriteAuditError("write-audit initialization failed") from exc
@@ -286,7 +305,13 @@ class WriteAuditStore:
 
     def close(self) -> None:
         with self._lock:
-            self._conn.close()
+            if self._closed:
+                return
+            try:
+                self._conn.close()
+            finally:
+                self._closed = True
+                self._process_lock.release()
 
     def _rollback_quietly(self) -> None:
         try:

@@ -20,6 +20,10 @@ category (`place`, `cancel`, or `unknown`), boot identifiers, and UTC timestamps
 does not contain tokens, accounts, symbols, quantities, prices, request IDs, order
 IDs, or request payloads.
 
+The server holds a non-blocking cross-process lock at `<database>.lock` for the
+store lifetime. A second process cannot open the same audit database or advance its
+boot metadata. The lock file may remain after shutdown and contains no secret data.
+
 Broker RPCs use an explicit allowlist: `account`, `positions`, `orders`, `trades`,
 `order_status`, `place_order`, and `cancel_order`. Any other `broker.*` action is
 durably counted as `unknown` and rejected before adapter dispatch.

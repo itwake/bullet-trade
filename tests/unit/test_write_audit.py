@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,7 +14,12 @@ from typing import Any, Dict, Tuple
 
 import pytest
 
-from bullet_trade.server.app import ServerApplication
+from bullet_trade.server.app import (
+    BROKER_ACTION_METHODS,
+    BROKER_READ_ACTION_METHODS,
+    BROKER_WRITE_ACTION_CATEGORIES,
+    ServerApplication,
+)
 from bullet_trade.server.config import ServerConfig
 from bullet_trade.server.write_audit import (
     AuditReceiptError,
@@ -84,6 +92,71 @@ def test_store_persists_identity_sequence_counters_and_boots(tmp_path: Path) -> 
     assert verify_receipt("token-one", receipt2, "nonce-qrstuvwxyz123456")
     assert not verify_receipt("token-two", receipt2, "nonce-qrstuvwxyz123456")
     second.close()
+
+
+def test_process_lock_blocks_second_store_without_overwriting_boot(tmp_path: Path) -> None:
+    path = tmp_path / "audit.sqlite3"
+    first = WriteAuditStore(str(path))
+    before = first.receipt("token", "first-process-nonce-01")["receipt"]
+
+    with pytest.raises(WriteAuditError, match="already in use"):
+        WriteAuditStore(str(path))
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from bullet_trade.server.write_audit import WriteAuditError, WriteAuditStore; "
+                "\ntry: WriteAuditStore(sys.argv[1])"
+                "\nexcept WriteAuditError: raise SystemExit(0)"
+                "\nraise SystemExit(3)"
+            ),
+            str(path),
+        ],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    after = first.receipt("token", "first-process-nonce-02")["receipt"]
+    assert after["boot_sequence"] == before["boot_sequence"]
+    assert after["boot_id"] == before["boot_id"]
+    assert Path(f"{path}.lock").exists()
+    first.close()
+    lock_path = Path(f"{path}.lock")
+    if lock_path.exists():
+        assert b"token" not in lock_path.read_bytes()
+
+    restarted = WriteAuditStore(str(path))
+    restarted_receipt = restarted.receipt("token", "restarted-process-nonce")
+    assert restarted_receipt["receipt"]["boot_sequence"] == before["boot_sequence"] + 1
+    restarted.close()
+
+
+def test_initialization_failure_releases_process_lock(tmp_path: Path) -> None:
+    path = tmp_path / "audit.sqlite3"
+    path.write_bytes(b"not sqlite")
+    with pytest.raises(WriteAuditError, match="initialization failed"):
+        WriteAuditStore(str(path))
+    path.unlink()
+    recovered = WriteAuditStore(str(path))
+    assert recovered.boot_sequence == 1
+    recovered.close()
+
+
+def test_process_lock_can_be_released_from_server_shutdown_thread(tmp_path: Path) -> None:
+    path = tmp_path / "audit.sqlite3"
+    store = WriteAuditStore(str(path))
+    closer = threading.Thread(target=store.close)
+    closer.start()
+    closer.join(timeout=5)
+    assert not closer.is_alive()
+    reopened = WriteAuditStore(str(path))
+    assert reopened.boot_sequence == 2
+    reopened.close()
 
 
 def test_concurrent_records_have_gapless_global_sequence(tmp_path: Path) -> None:
@@ -173,6 +246,37 @@ async def test_direct_handle_audits_writes_and_unknown_before_dispatch(tmp_path:
     assert broker.calls == ["place", "cancel"]
     assert app.write_audit is not None
     envelope = app.write_audit.receipt("token", "direct-handle-nonce-001")
+    assert envelope["receipt"]["counters"] == {"place": 1, "cancel": 1, "unknown": 1}
+    app.write_audit.close()
+
+
+@pytest.mark.asyncio
+async def test_broker_read_write_definitions_are_disjoint_and_complete(tmp_path: Path) -> None:
+    expected_reads = {
+        "broker.account": "get_account_info",
+        "broker.positions": "get_positions",
+        "broker.orders": "list_orders",
+        "broker.trades": "list_trades",
+        "broker.order_status": "get_order_status",
+    }
+    expected_writes = {
+        "broker.place_order": "place",
+        "broker.cancel_order": "cancel",
+    }
+    assert BROKER_READ_ACTION_METHODS == expected_reads
+    assert BROKER_WRITE_ACTION_CATEGORIES == expected_writes
+    assert set(BROKER_READ_ACTION_METHODS).isdisjoint(BROKER_WRITE_ACTION_CATEGORIES)
+    assert set(BROKER_ACTION_METHODS) == set(expected_reads) | set(expected_writes)
+
+    app, _broker = _app(str(tmp_path / "audit.sqlite3"))
+    for action in expected_reads:
+        await app._audit_broker_request(action)
+    for action in expected_writes:
+        await app._audit_broker_request(action)
+    with pytest.raises(ValueError, match="unknown broker action"):
+        await app._audit_broker_request("broker.not_a_read")
+    assert app.write_audit is not None
+    envelope = app.write_audit.receipt("token", "classification-nonce-001")
     assert envelope["receipt"]["counters"] == {"place": 1, "cancel": 1, "unknown": 1}
     app.write_audit.close()
 
@@ -282,6 +386,34 @@ async def test_write_audit_runs_off_event_loop(tmp_path: Path, monkeypatch) -> N
     ] is True
     await write_task
     assert broker.calls == ["place"]
+    app.write_audit.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_receipt_runs_off_event_loop(tmp_path: Path, monkeypatch) -> None:
+    app, _broker = _app(str(tmp_path / "audit.sqlite3"))
+    assert app.write_audit is not None
+    original_receipt = app.write_audit.receipt
+
+    def slow_receipt(token: str, nonce: str):
+        time.sleep(0.1)
+        return original_receipt(token, nonce)
+
+    monkeypatch.setattr(app.write_audit, "receipt", slow_receipt)
+    receipt_task = asyncio.create_task(
+        app.handle_request(
+            _session(),
+            "admin.audit_receipt",
+            {"nonce": "nonblocking-receipt-001"},
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert not receipt_task.done()
+    assert (await app.handle_request(_session(), "admin.health", {}))["value"][
+        "audit_ready"
+    ] is True
+    envelope = await receipt_task
+    assert verify_receipt("token", envelope, "nonblocking-receipt-001")
     app.write_audit.close()
 
 

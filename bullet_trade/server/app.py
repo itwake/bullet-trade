@@ -33,19 +33,24 @@ from .session import ClientSession
 from .tick import TickSubscriptionManager
 from .write_audit import WriteAuditError, WriteAuditStore
 
-BROKER_ACTION_METHODS = {
-    "account": "get_account_info",
-    "positions": "get_positions",
-    "orders": "list_orders",
-    "trades": "list_trades",
-    "order_status": "get_order_status",
-    "place_order": "place_order",
-    "cancel_order": "cancel_order",
+BROKER_READ_ACTION_METHODS = {
+    "broker.account": "get_account_info",
+    "broker.positions": "get_positions",
+    "broker.orders": "list_orders",
+    "broker.trades": "list_trades",
+    "broker.order_status": "get_order_status",
 }
-BROKER_WRITE_CATEGORIES = {
+BROKER_WRITE_ACTION_CATEGORIES = {
     "broker.place_order": "place",
     "broker.cancel_order": "cancel",
 }
+_BROKER_ACTION_OVERLAP = set(BROKER_READ_ACTION_METHODS) & set(BROKER_WRITE_ACTION_CATEGORIES)
+if _BROKER_ACTION_OVERLAP:
+    raise RuntimeError("broker read/write action definitions overlap")
+BROKER_ACTION_METHODS = dict(BROKER_READ_ACTION_METHODS)
+BROKER_ACTION_METHODS.update(
+    {action: action.split(".", 1)[1] for action in BROKER_WRITE_ACTION_CATEGORIES}
+)
 
 
 class UnknownBrokerActionError(ValueError):
@@ -254,7 +259,13 @@ class ServerApplication:
             if not self._audit_ready or self.write_audit is None:
                 raise WriteAuditError("write audit is unavailable")
             try:
-                return self.write_audit.receipt(self.config.token, payload.get("nonce"))
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None,
+                    self.write_audit.receipt,
+                    self.config.token,
+                    payload.get("nonce"),
+                )
             except WriteAuditError:
                 self._audit_ready = False
                 raise
@@ -263,20 +274,20 @@ class ServerApplication:
         if action.startswith("data."):
             return await self._dispatch_data(action.split(".", 1)[1], payload)
         if action.startswith("broker."):
-            return await self._dispatch_broker(session, action.split(".", 1)[1], payload)
+            return await self._dispatch_broker(session, action, payload)
         raise ValueError(f"未知 action: {action}")
 
     async def _audit_broker_request(self, action: str) -> None:
         """Commit a broker write attempt without blocking the event loop."""
 
         normalized = str(action)
-        category = BROKER_WRITE_CATEGORIES.get(normalized)
+        category = BROKER_WRITE_ACTION_CATEGORIES.get(normalized)
         unknown = False
+        if normalized in BROKER_READ_ACTION_METHODS:
+            return
         if category is None and normalized.startswith("broker."):
-            method = normalized.split(".", 1)[1]
-            if method not in BROKER_ACTION_METHODS:
-                category = "unknown"
-                unknown = True
+            category = "unknown"
+            unknown = True
         if category is None:
             return
         if not self._audit_ready or self.write_audit is None:
@@ -314,9 +325,13 @@ class ServerApplication:
             raise ValueError(f"数据接口 {method} 未实现")
         return await fn(payload)
 
-    async def _dispatch_broker(self, session: ClientSession, method: str, payload: Dict) -> Dict:
+    async def _dispatch_broker(self, session: ClientSession, action: str, payload: Dict) -> Dict:
         if not self.adapters.broker_adapter:
             raise RuntimeError("券商服务未启用")
+        impl = BROKER_ACTION_METHODS.get(action)
+        if impl is None:
+            raise UnknownBrokerActionError("unknown broker action")
+        method = action.split(".", 1)[1]
         account_key = payload.get("account_key") or session.account_key
         sub_account_id = payload.get("sub_account_id") or session.sub_account_id
         resolved_key, sub_cfg = self.virtual_accounts.resolve(account_key, sub_account_id)
@@ -335,9 +350,6 @@ class ServerApplication:
             await self._maybe_reject_when_paused(payload)
             await self._maybe_fill_price(payload)
             await self.virtual_accounts.ensure_within_limit(sub_cfg, _estimate_order_value(payload))
-        impl = BROKER_ACTION_METHODS.get(method)
-        if impl is None:
-            raise ValueError("unknown broker action")
         fn = getattr(self.adapters.broker_adapter, impl, None)
         if not fn:
             raise ValueError(f"券商接口 {method} 未实现")
