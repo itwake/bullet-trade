@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -23,9 +24,9 @@ from .base import (
 )
 from .qmt import dataframe_to_payload, dict_payload
 
-
 _DATA_ACTIONS = (
     "data.history",
+    "data.market_probe",
     "data.snapshot",
     "data.current_tick",
     "data.live_current",
@@ -114,6 +115,7 @@ class BigQmtGatewayClient:
         self._last_error: Optional[str] = None
         self._last_success_at: Optional[float] = None
         self._last_failure_at: Optional[float] = None
+        self._market_probe_observed = False
 
     async def get(self, path: str) -> Any:
         return await self._run_blocking(self.request_json, path, None, "GET")
@@ -135,11 +137,18 @@ class BigQmtGatewayClient:
         raise BigQmtGatewayError("未配置 big QMT gateway path", code="NOT_IMPLEMENTED")
 
     async def health(self) -> Dict[str, Any]:
+        self._market_probe_observed = False
         value = await self.get("/health")
         if isinstance(value, dict):
             self._last_health = value
+            self._market_probe_observed = _health_market_probe_observed(value)
             return value
         return {"raw": value}
+
+    def mark_market_probe_observed(self) -> None:
+        """Remember a validated probe response from the current gateway client."""
+
+        self._market_probe_observed = True
 
     def request_json(
         self,
@@ -220,9 +229,25 @@ class BigQmtGatewayClient:
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "last_failure_at": self._last_failure_at,
-            "actions": self.config.action_status,
+            "actions": self._action_status_snapshot(),
             "big_qmt_gateway": health,
         }
+
+    def _action_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        actions = {
+            action: dict(status)
+            for action, status in self.config.action_status.items()
+        }
+        configured = actions.get("data.market_probe")
+        if configured is not None and configured.get("status") != "unavailable":
+            if self._market_probe_observed:
+                actions["data.market_probe"] = _status("ready", "")
+            else:
+                actions["data.market_probe"] = _status(
+                    "degraded",
+                    "validated market probe capability has not been observed",
+                )
+        return actions
 
     async def _run_blocking(self, func, *args):
         loop = asyncio.get_running_loop()
@@ -286,6 +311,23 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         security = payload.get("security")
         data = await self.client.post_first(("/data/snapshot", "/data/current_tick"), payload)
         return _normalize_snapshot_tick(_select_tick(data, security), security)
+
+    async def get_market_probe(self, payload: Dict) -> Dict:
+        if type(payload) is not dict or set(payload) != {"security"}:
+            raise BigQmtGatewayError(
+                "market probe payload schema is invalid",
+                code="MARKET_PROBE_SCHEMA_INVALID",
+            )
+        security = _market_probe_security(payload["security"])
+        data = await self.client.post(
+            "/data/market_probe",
+            {"security": security},
+        )
+        result = _validate_market_probe_payload(data, security)
+        marker = getattr(self.client, "mark_market_probe_observed", None)
+        if callable(marker):
+            marker()
+        return result
 
     async def get_live_current(self, payload: Dict) -> Dict:
         security = payload.get("security")
@@ -616,6 +658,11 @@ def _build_action_status(
     for action in _DATA_ACTIONS:
         if not server_config.enable_data:
             status[action] = _status("unavailable", "data module disabled")
+        elif action == "data.market_probe":
+            status[action] = _status(
+                "degraded",
+                "validated market probe capability has not been observed",
+            )
         elif action in _POLLING_SUBSCRIPTION_ACTIONS:
             status[action] = _status(
                 "degraded",
@@ -655,6 +702,15 @@ def _health_bool(payload: Dict[str, Any], key: str) -> Optional[bool]:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return bool(value)
+
+
+def _health_market_probe_observed(payload: Dict[str, Any]) -> bool:
+    qmt_apis = payload.get("qmt_apis")
+    return (
+        isinstance(qmt_apis, dict)
+        and type(qmt_apis.get("market_probe")) is bool
+        and qmt_apis["market_probe"] is True
+    )
 
 
 def _is_dict_payload(value: Any) -> bool:
@@ -819,6 +875,107 @@ def _normalize_live_current_tick(tick: Dict[str, Any]) -> Dict:
         ),
         "paused": bool(paused),
     }
+
+
+_MARKET_PROBE_TICK_FIELDS = {
+    "timestamp",
+    "last_price",
+    "volume",
+    "previous_close",
+    "bid1_price",
+    "bid1_volume",
+    "ask1_price",
+    "ask1_volume",
+    "suspended",
+    "is_st",
+}
+
+
+def _market_probe_security(value: Any) -> str:
+    if type(value) is not str or not value or value.strip() != value:
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    return value
+
+
+def _market_probe_number(value: Any, *, integral: bool) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    if integral:
+        if not number.is_integer():
+            raise BigQmtGatewayError(
+                "market probe payload schema is invalid",
+                code="MARKET_PROBE_SCHEMA_INVALID",
+            )
+        return int(number)
+    return number
+
+
+def _validate_market_probe_payload(value: Any, security: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"schema_version", "security", "tick"}:
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    expected_security = _market_probe_security(security)
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("security") != expected_security
+    ):
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    tick = value.get("tick")
+    if not isinstance(tick, dict) or set(tick) != _MARKET_PROBE_TICK_FIELDS:
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    timestamp = tick.get("timestamp")
+    if (
+        not isinstance(timestamp, str)
+        or len(timestamp) != 14
+        or not timestamp.isdigit()
+        or type(tick.get("suspended")) is not bool
+        or type(tick.get("is_st")) is not bool
+    ):
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        )
+    try:
+        datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise BigQmtGatewayError(
+            "market probe payload schema is invalid",
+            code="MARKET_PROBE_SCHEMA_INVALID",
+        ) from exc
+    normalized_tick = {
+        "timestamp": timestamp,
+        "last_price": _market_probe_number(tick["last_price"], integral=False),
+        "volume": _market_probe_number(tick["volume"], integral=True),
+        "previous_close": _market_probe_number(tick["previous_close"], integral=False),
+        "bid1_price": _market_probe_number(tick["bid1_price"], integral=False),
+        "bid1_volume": _market_probe_number(tick["bid1_volume"], integral=True),
+        "ask1_price": _market_probe_number(tick["ask1_price"], integral=False),
+        "ask1_volume": _market_probe_number(tick["ask1_volume"], integral=True),
+        "suspended": tick["suspended"],
+        "is_st": tick["is_st"],
+    }
+    return {"schema_version": 1, "security": expected_security, "tick": normalized_tick}
 
 
 def _virtual_account_id(payload: Dict[str, Any]) -> str:

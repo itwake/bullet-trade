@@ -1,9 +1,10 @@
+import copy
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from tornado.httputil import HTTPHeaders
-
 
 TEST_ACCOUNT_ID = "test_account_id"
 
@@ -103,6 +104,45 @@ class _FakeContext:
         }
 
 
+class _MarketProbeContext:
+    def __init__(self, tick=None, instrument=None):
+        self.tick = tick or {
+            "timetag": "20260811 10:02:20",
+            "lastPrice": 12.3,
+            "volume": 1234,
+            "lastClose": 12.0,
+            "bidPrice": [12.29, 12.28],
+            "bidVol": [100, 200],
+            "askPrice": [12.31, 12.32],
+            "askVol": [300, 400],
+            "openInt": 13,
+            "raw_private_field": "must-not-be-returned",
+        }
+        self.instrument = instrument or {
+            "InstrumentName": "Ping An Bank",
+            "InstrumentStatus": 0,
+            "raw_private_field": "must-not-be-returned",
+        }
+        self.tick_key = "000001.SZ"
+        self.calls = []
+
+    def get_full_tick(self, stock_code=None):
+        self.calls.append(("get_full_tick", list(stock_code or [])))
+        return {self.tick_key: copy.deepcopy(self.tick)}
+
+    def get_instrument_detail(self, security, is_complete=True):
+        self.calls.append(("get_instrument_detail", security, is_complete))
+        return copy.deepcopy(self.instrument)
+
+
+class _LegacyMarketProbeContext(_MarketProbeContext):
+    get_instrument_detail = None
+
+    def get_instrumentdetail(self, security):
+        self.calls.append(("get_instrumentdetail", security))
+        return copy.deepcopy(self.instrument)
+
+
 class _FakeContextWithIndexWeight(_FakeContext):
     def __init__(self):
         super().__init__()
@@ -173,10 +213,299 @@ def test_big_qmt_helper_keeps_current_tick_as_snapshot_capability():
     assert context.full_tick_codes == ["000001.SZ"]
 
 
+def test_big_qmt_helper_market_probe_projects_exact_read_only_schema():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+
+    response = helper._dispatch_qmt_action(
+        context,
+        "market_probe",
+        {"security": "000001.XSHE", "request_id": "r-market-probe"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"] == {
+        "schema_version": 1,
+        "security": "000001.XSHE",
+        "tick": {
+            "timestamp": "20260811100220",
+            "last_price": 12.3,
+            "volume": 1234,
+            "previous_close": 12.0,
+            "bid1_price": 12.29,
+            "bid1_volume": 100,
+            "ask1_price": 12.31,
+            "ask1_volume": 300,
+            "suspended": False,
+            "is_st": False,
+        },
+    }
+    assert context.calls == [
+        ("get_full_tick", ["000001.SZ"]),
+        ("get_instrument_detail", "000001.SZ", True),
+    ]
+    assert "raw_private_field" not in str(response["value"])
+
+
+def test_big_qmt_helper_market_probe_preserves_original_security_without_coercion():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.SZ", "request_id": "r-market-original-security"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["security"] == "000001.SZ"
+    assert context.calls[0] == ("get_full_tick", ["000001.SZ"])
+
+
+def test_big_qmt_helper_market_probe_route_is_explicit():
+    helper = _load_helper()
+
+    assert (
+        helper._route_to_action("/data/market_probe", {"security": "000001.XSHE"})
+        == "market_probe"
+    )
+
+
+def test_big_qmt_helper_market_probe_derives_st_and_suspension_from_documented_fields():
+    helper = _load_helper()
+    context = _MarketProbeContext(
+        tick={
+            "timetag": "20260811 10:02:20",
+            "lastPrice": 12.3,
+            "volume": 1234,
+            "lastClose": 12.0,
+            "bidPrice": [12.29],
+            "bidVol": [100],
+            "askPrice": [12.31],
+            "askVol": [300],
+            "openInt": 16,
+        },
+        instrument={"InstrumentName": "*ST Example", "InstrumentStatus": 0},
+    )
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-status"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["tick"]["suspended"] is True
+    assert response["value"]["tick"]["is_st"] is True
+
+
+def test_big_qmt_helper_market_probe_accepts_consistent_time_and_stime():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    context.tick.pop("timetag")
+    context.tick.update(
+        {
+            "time": 1786413740000,
+            "stime": "20260811100220.000",
+        }
+    )
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-timestamps"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["tick"]["timestamp"] == "20260811100220"
+
+
+def test_big_qmt_helper_market_probe_supports_legacy_instrument_detail_api():
+    helper = _load_helper()
+    context = _LegacyMarketProbeContext(
+        instrument={"InstrumentName": "Ping An Bank", "InstrumentStatus": 2}
+    )
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-legacy"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["tick"]["suspended"] is True
+    assert context.calls[-1] == ("get_instrumentdetail", "000001.SZ")
+
+
+def _delete_market_source_field(context, field):
+    context.tick.pop(field)
+
+
+def _empty_market_level(context, field):
+    context.tick[field] = []
+
+
+def _set_invalid_market_open_int(context, value):
+    context.tick["openInt"] = value
+
+
+def _delete_instrument_field(context, field):
+    context.instrument.pop(field)
+
+
+def _conflict_market_timestamps(context):
+    context.tick["stime"] = "20260811100221.000"
+
+
+def _use_wrong_market_tick_key(context):
+    context.tick_key = "000002.SZ"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(
+            lambda context: _delete_market_source_field(context, "lastClose"),
+            id="missing-previous-close",
+        ),
+        pytest.param(
+            lambda context: _empty_market_level(context, "askVol"),
+            id="empty-ask-volume",
+        ),
+        pytest.param(
+            lambda context: _set_invalid_market_open_int(context, 0),
+            id="unknown-open-int",
+        ),
+        pytest.param(
+            lambda context: _set_invalid_market_open_int(context, False),
+            id="boolean-open-int",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": float("nan")}),
+            id="nan-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": -1}),
+            id="negative-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": 1.5}),
+            id="fractional-volume",
+        ),
+        pytest.param(
+            lambda context: _delete_instrument_field(context, "InstrumentStatus"),
+            id="missing-instrument-status",
+        ),
+        pytest.param(
+            lambda context: _delete_instrument_field(context, "InstrumentName"),
+            id="missing-instrument-name",
+        ),
+        pytest.param(_conflict_market_timestamps, id="conflicting-timestamps"),
+        pytest.param(_use_wrong_market_tick_key, id="wrong-ticker-key"),
+    ],
+)
+def test_big_qmt_helper_market_probe_fails_closed_without_required_source_facts(mutation):
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    mutation(context)
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-invalid"},
+    )
+
+    assert response["ok"] is False
+    assert response["code"] == "MARKET_PROBE_SCHEMA_INVALID"
+    assert response["message"] == "market probe source data is incomplete or invalid"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({}, id="missing-security"),
+        pytest.param({"security": "not-a-security"}, id="invalid-security"),
+        pytest.param(
+            {"security": "000001.XSHE", "securities": ["000001.XSHE"]},
+            id="ambiguous-security-shape",
+        ),
+        pytest.param(
+            {"ticker": "000001.XSHE"},
+            id="wrong-ticker-key",
+        ),
+        pytest.param(
+            {"security": "000001.XSHE", "ticker": "000002.XSHE"},
+            id="unexpected-ticker-key",
+        ),
+    ],
+)
+def test_big_qmt_helper_market_probe_requires_exactly_one_supported_security(payload):
+    helper = _load_helper()
+    context = _MarketProbeContext()
+
+    response = helper._query_market_probe(context, payload)
+
+    assert response["ok"] is False
+    assert response["code"] == "MARKET_PROBE_BAD_REQUEST"
+    assert context.calls == []
+
+
+def test_big_qmt_helper_market_probe_redacts_read_exceptions(caplog):
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    sensitive_marker = "secret-account-token-and-payload"
+
+    def raise_sensitive_read_error(stock_code=None):
+        raise RuntimeError(sensitive_marker)
+
+    context.get_full_tick = raise_sensitive_read_error
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-redaction"},
+    )
+
+    assert response["ok"] is False
+    assert response["code"] == "MARKET_PROBE_READ_FAILED"
+    assert response["message"] == "market probe QMT read failed"
+    assert sensitive_marker not in str(response)
+    assert sensitive_marker not in caplog.text
+
+
+def test_runtime_market_probe_capability_requires_successful_observation():
+    helper = _load_helper()
+    runtime = helper._GatewayRuntime()
+    runtime.context_info = _MarketProbeContext()
+    runtime.direct_dispatch = True
+
+    assert runtime.health()["qmt_apis"]["market_probe"] is False
+
+    response = runtime.submit(
+        "market_probe",
+        {"security": "000001.XSHE", "request_id": "r-market-capability"},
+    )
+
+    assert response["ok"] is True
+    assert runtime.health()["qmt_apis"]["market_probe"] is True
+
+
+def test_runtime_market_probe_failure_does_not_claim_capability():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    context.tick.pop("volume")
+    runtime = helper._GatewayRuntime()
+    runtime.context_info = context
+    runtime.direct_dispatch = True
+
+    response = runtime.submit(
+        "market_probe",
+        {"security": "000001.XSHE", "request_id": "r-market-capability-fail"},
+    )
+
+    assert response["ok"] is False
+    assert runtime.health()["qmt_apis"]["market_probe"] is False
+
+
 def test_big_qmt_gateway_handler_reads_request_headers():
     helper = _load_helper()
     handler = object.__new__(helper._GatewayHandler)
-    handler.request = SimpleNamespace(headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"}))
+    handler.request = SimpleNamespace(
+        headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"})
+    )
 
     assert handler._request_id() == "r-headers"
 
