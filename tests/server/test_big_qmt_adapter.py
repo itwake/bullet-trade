@@ -72,7 +72,7 @@ def _server_config(enable_data=True, enable_broker=True):
 
 def _market_probe_payload(security="000001.XSHE"):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "security": security,
         "tick": {
             "timestamp": "20260811100220",
@@ -85,6 +85,14 @@ def _market_probe_payload(security="000001.XSHE"):
             "ask1_volume": 200,
             "suspended": False,
             "is_st": False,
+        },
+        "minute_bar": {
+            "timestamp": "20260811100100",
+            "open": 12.1,
+            "high": 12.4,
+            "low": 12.0,
+            "close": 12.3,
+            "volume": 321,
         },
     }
 
@@ -103,13 +111,14 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.market_probe"]["status"] == "degraded"
+    assert health["qmt"]["actions"]["data.market_probe"]["schema_version"] == 2
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
     assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
     assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
 
 
 @pytest.mark.asyncio
-async def test_big_qmt_market_probe_health_is_fail_closed_until_observed():
+async def test_big_qmt_market_probe_health_is_fail_closed_until_capability_self_check():
     config = _server_config()
     router = AccountRouter(config.accounts)
     bundle = build_big_qmt_bundle(config, router)
@@ -124,19 +133,48 @@ async def test_big_qmt_market_probe_health_is_fail_closed_until_observed():
     await client.health()
     assert client.qmt_status()["actions"]["data.market_probe"]["status"] == "degraded"
 
-    async def health_with_unobserved_capability(_path):
+    async def health_without_implemented_capability(_path):
         return {"ready": True, "qmt_apis": {"market_probe": False}}
 
-    client.get = health_with_unobserved_capability
+    client.get = health_without_implemented_capability
     await client.health()
     assert client.qmt_status()["actions"]["data.market_probe"]["status"] == "degraded"
 
-    async def health_with_observed_capability(_path):
+    async def health_without_schema_version(_path):
         return {"ready": True, "qmt_apis": {"market_probe": True}}
 
-    client.get = health_with_observed_capability
+    client.get = health_without_schema_version
     await client.health()
-    assert client.qmt_status()["actions"]["data.market_probe"] == {"status": "ready"}
+    assert client.qmt_status()["actions"]["data.market_probe"]["status"] == "degraded"
+
+    async def health_with_v1_capability(_path):
+        return {
+            "ready": True,
+            "qmt_apis": {
+                "market_probe": True,
+                "market_probe_schema_version": 1,
+            },
+        }
+
+    client.get = health_with_v1_capability
+    await client.health()
+    assert client.qmt_status()["actions"]["data.market_probe"]["status"] == "degraded"
+
+    async def health_with_implemented_capability(_path):
+        return {
+            "ready": True,
+            "qmt_apis": {
+                "market_probe": True,
+                "market_probe_schema_version": 2,
+            },
+        }
+
+    client.get = health_with_implemented_capability
+    await client.health()
+    assert client.qmt_status()["actions"]["data.market_probe"] == {
+        "status": "ready",
+        "schema_version": 2,
+    }
 
     async def malformed_health(_path):
         return "unexpected-health-shape"
@@ -147,7 +185,38 @@ async def test_big_qmt_market_probe_health_is_fail_closed_until_observed():
 
 
 @pytest.mark.asyncio
-async def test_big_qmt_validated_market_probe_marks_capability_observed():
+async def test_server_health_reports_market_probe_ready_before_first_probe():
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    bundle = build_big_qmt_bundle(config, router)
+    client = bundle.data_adapter.client
+    gateway_calls = []
+
+    async def helper_health(path):
+        gateway_calls.append(("GET", path))
+        return {
+            "ready": True,
+            "qmt_apis": {
+                "market_probe": True,
+                "market_probe_schema_version": 2,
+            },
+        }
+
+    client.get = helper_health
+    await client.health()
+    app = ServerApplication(config, router, bundle)
+
+    health = app._health_snapshot()["value"]
+
+    assert health["qmt"]["actions"]["data.market_probe"] == {
+        "status": "ready",
+        "schema_version": 2,
+    }
+    assert gateway_calls == [("GET", "/health")]
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_validated_market_probe_does_not_override_health_capability():
     config = _server_config()
     router = AccountRouter(config.accounts)
     bundle = build_big_qmt_bundle(config, router)
@@ -164,7 +233,37 @@ async def test_big_qmt_validated_market_probe_marks_capability_observed():
 
     assert result["security"] == "000001.XSHE"
     assert calls == [("/data/market_probe", {"security": "000001.XSHE"})]
-    assert client.qmt_status()["actions"]["data.market_probe"] == {"status": "ready"}
+    assert client.qmt_status()["actions"]["data.market_probe"]["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_market_probe_preserves_max_safe_integer_volume_and_int_price():
+    payload = _market_probe_payload()
+    max_volume = (1 << 53) - 1
+    payload["tick"].update(
+        {
+            "last_price": 999_999_999_999,
+            "volume": max_volume,
+        }
+    )
+    payload["minute_bar"].update(
+        {
+            "open": 999_999_999_996,
+            "high": 999_999_999_999,
+            "low": 999_999_999_995,
+            "close": 999_999_999_998,
+            "volume": max_volume,
+        }
+    )
+    client = _FakeGatewayClient({"/data/market_probe": payload})
+    adapter = BigQmtDataAdapter(client)
+
+    result = await adapter.get_market_probe({"security": "000001.XSHE"})
+
+    assert result["tick"]["last_price"] == 999_999_999_999
+    assert type(result["tick"]["last_price"]) is int
+    assert result["tick"]["volume"] == max_volume
+    assert result["minute_bar"]["volume"] == max_volume
 
 
 @pytest.mark.asyncio
@@ -249,7 +348,7 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     "mutation",
     [
         pytest.param(lambda value: value.update({"unexpected": True}), id="extra-root-field"),
-        pytest.param(lambda value: value.update({"schema_version": 2}), id="wrong-schema"),
+        pytest.param(lambda value: value.update({"schema_version": 1}), id="wrong-schema"),
         pytest.param(
             lambda value: value.update({"security": "000002.XSHE"}),
             id="wrong-security",
@@ -264,8 +363,64 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
             id="boolean-volume",
         ),
         pytest.param(
+            lambda value: value["tick"].update({"volume": 1234.0}),
+            id="float-wire-volume",
+        ),
+        pytest.param(
+            lambda value: value["tick"].update({"volume": 1 << 53}),
+            id="two-to-53-wire-volume",
+        ),
+        pytest.param(
+            lambda value: value["tick"].update({"volume": (1 << 53) + 1}),
+            id="two-to-53-plus-one-wire-volume",
+        ),
+        pytest.param(
+            lambda value: value["tick"].update({"volume": float("inf")}),
+            id="infinite-wire-volume",
+        ),
+        pytest.param(
+            lambda value: value["tick"].update({"last_price": 1_000_000_000_001}),
+            id="oversized-wire-price",
+        ),
+        pytest.param(
+            lambda value: value["tick"].update({"last_price": float("inf")}),
+            id="infinite-wire-price",
+        ),
+        pytest.param(
             lambda value: value["tick"].update({"timestamp": "20260230093000"}),
             id="invalid-calendar-timestamp",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].pop("volume"),
+            id="missing-bar-field",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"unexpected": 1}),
+            id="extra-bar-field",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"volume": 1.5}),
+            id="fractional-bar-volume",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"volume": 321.0}),
+            id="float-wire-bar-volume",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"volume": 1 << 53}),
+            id="two-to-53-wire-bar-volume",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"volume": (1 << 53) + 1}),
+            id="two-to-53-plus-one-wire-bar-volume",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"timestamp": "20260811100200"}),
+            id="unclosed-bar",
+        ),
+        pytest.param(
+            lambda value: value["minute_bar"].update({"high": 12.2}),
+            id="invalid-bar-high",
         ),
     ],
 )
@@ -290,6 +445,8 @@ async def test_big_qmt_market_probe_adapter_fails_closed_on_unknown_schema(mutat
         600000,
         " 000001.XSHE ",
         "",
+        "000001.NYSE",
+        "00001.XSHE",
         pytest.param(_SecurityThatMustNotBeCoerced(), id="non-string-no-coercion"),
     ],
 )

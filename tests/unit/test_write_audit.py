@@ -54,7 +54,7 @@ class _MarketProbeDataAdapter:
     async def get_market_probe(self, payload) -> Dict[str, Any]:
         self.calls.append(dict(payload))
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "security": payload["security"],
             "tick": {
                 "timestamp": "20260811100220",
@@ -67,6 +67,14 @@ class _MarketProbeDataAdapter:
                 "ask1_volume": 200,
                 "suspended": False,
                 "is_st": False,
+            },
+            "minute_bar": {
+                "timestamp": "20260811100100",
+                "open": 12.1,
+                "high": 12.4,
+                "low": 12.0,
+                "close": 12.3,
+                "volume": 321,
             },
         }
 
@@ -289,7 +297,7 @@ async def test_data_market_probe_never_advances_write_audit_counters(tmp_path: P
     )
 
     after = app.write_audit.receipt("token", "market-probe-after-00001")["receipt"]
-    assert response["schema_version"] == 1
+    assert response["schema_version"] == 2
     assert data.calls == [{"security": "000001.XSHE"}]
     assert broker.calls == []
     assert before["global_seq"] == after["global_seq"] == 0

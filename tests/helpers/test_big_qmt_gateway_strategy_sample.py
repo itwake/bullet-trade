@@ -124,6 +124,10 @@ class _MarketProbeContext:
             "raw_private_field": "must-not-be-returned",
         }
         self.tick_key = "000001.SZ"
+        self.bar_key = "000001.SZ"
+        self.bar_columns = ["open", "high", "low", "close", "volume"]
+        self.bar_indexes = ["20260811100200"]
+        self.bar_rows = [[12.1, 12.4, 12.0, 12.3, 321.0]]
         self.calls = []
 
     def get_full_tick(self, stock_code=None):
@@ -133,6 +137,15 @@ class _MarketProbeContext:
     def get_instrument_detail(self, security, is_complete=True):
         self.calls.append(("get_instrument_detail", security, is_complete))
         return copy.deepcopy(self.instrument)
+
+    def get_market_data_ex(self, fields, stock_code, **kwargs):
+        self.calls.append(("get_market_data_ex", list(fields), list(stock_code), dict(kwargs)))
+        frame = _FakeFrameSelected(
+            self.bar_columns,
+            copy.deepcopy(self.bar_rows),
+            index=SimpleNamespace(tolist=lambda: list(self.bar_indexes), name=None),
+        )
+        return {self.bar_key: frame}
 
 
 class _LegacyMarketProbeContext(_MarketProbeContext):
@@ -225,7 +238,7 @@ def test_big_qmt_helper_market_probe_projects_exact_read_only_schema():
 
     assert response["ok"] is True
     assert response["value"] == {
-        "schema_version": 1,
+        "schema_version": 2,
         "security": "000001.XSHE",
         "tick": {
             "timestamp": "20260811100220",
@@ -239,10 +252,32 @@ def test_big_qmt_helper_market_probe_projects_exact_read_only_schema():
             "suspended": False,
             "is_st": False,
         },
+        "minute_bar": {
+            "timestamp": "20260811100100",
+            "open": 12.1,
+            "high": 12.4,
+            "low": 12.0,
+            "close": 12.3,
+            "volume": 321,
+        },
     }
     assert context.calls == [
         ("get_full_tick", ["000001.SZ"]),
         ("get_instrument_detail", "000001.SZ", True),
+        (
+            "get_market_data_ex",
+            ["open", "high", "low", "close", "volume"],
+            ["000001.SZ"],
+            {
+                "period": "1m",
+                "start_time": "",
+                "end_time": "20260811100200",
+                "count": 1,
+                "dividend_type": "none",
+                "fill_data": False,
+                "subscribe": False,
+            },
+        ),
     ]
     assert "raw_private_field" not in str(response["value"])
 
@@ -317,6 +352,63 @@ def test_big_qmt_helper_market_probe_accepts_consistent_time_and_stime():
     assert response["value"]["tick"]["timestamp"] == "20260811100220"
 
 
+def test_big_qmt_helper_market_probe_preserves_raw_bar_prices_and_lot_volume():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    context.bar_rows = [
+        [
+            12.123456789,
+            12.987654321,
+            12.012345678,
+            12.876543219,
+            7.0,
+        ]
+    ]
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-raw-bar"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["minute_bar"] == {
+        "timestamp": "20260811100100",
+        "open": 12.123456789,
+        "high": 12.987654321,
+        "low": 12.012345678,
+        "close": 12.876543219,
+        "volume": 7,
+    }
+
+
+def test_big_qmt_helper_market_probe_preserves_bounded_integer_wire_values():
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    max_volume = (1 << 53) - 1
+    context.tick["lastPrice"] = 999_999_999_999
+    context.tick["volume"] = max_volume
+    context.bar_rows = [
+        [
+            999_999_999_996,
+            999_999_999_999,
+            999_999_999_995,
+            999_999_999_998,
+            float(max_volume),
+        ]
+    ]
+
+    response = helper._query_market_probe(
+        context,
+        {"security": "000001.XSHE", "request_id": "r-market-exact-integers"},
+    )
+
+    assert response["ok"] is True
+    assert response["value"]["tick"]["last_price"] == 999_999_999_999
+    assert type(response["value"]["tick"]["last_price"]) is int
+    assert response["value"]["tick"]["volume"] == max_volume
+    assert response["value"]["minute_bar"]["volume"] == max_volume
+
+
 def test_big_qmt_helper_market_probe_supports_legacy_instrument_detail_api():
     helper = _load_helper()
     context = _LegacyMarketProbeContext(
@@ -330,7 +422,7 @@ def test_big_qmt_helper_market_probe_supports_legacy_instrument_detail_api():
 
     assert response["ok"] is True
     assert response["value"]["tick"]["suspended"] is True
-    assert context.calls[-1] == ("get_instrumentdetail", "000001.SZ")
+    assert ("get_instrumentdetail", "000001.SZ") in context.calls
 
 
 def _delete_market_source_field(context, field):
@@ -355,6 +447,10 @@ def _conflict_market_timestamps(context):
 
 def _use_wrong_market_tick_key(context):
     context.tick_key = "000002.SZ"
+
+
+def _use_wrong_market_bar_key(context):
+    context.bar_key = "000002.SZ"
 
 
 @pytest.mark.parametrize(
@@ -389,6 +485,30 @@ def _use_wrong_market_tick_key(context):
             id="fractional-volume",
         ),
         pytest.param(
+            lambda context: context.tick.update({"volume": 1 << 53}),
+            id="two-to-53-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": (1 << 53) + 1}),
+            id="two-to-53-plus-one-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": True}),
+            id="boolean-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"volume": float("inf")}),
+            id="infinite-volume",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"lastPrice": 1_000_000_000_001}),
+            id="oversized-price",
+        ),
+        pytest.param(
+            lambda context: context.tick.update({"lastPrice": float("inf")}),
+            id="infinite-price",
+        ),
+        pytest.param(
             lambda context: _delete_instrument_field(context, "InstrumentStatus"),
             id="missing-instrument-status",
         ),
@@ -398,6 +518,31 @@ def _use_wrong_market_tick_key(context):
         ),
         pytest.param(_conflict_market_timestamps, id="conflicting-timestamps"),
         pytest.param(_use_wrong_market_tick_key, id="wrong-ticker-key"),
+        pytest.param(_use_wrong_market_bar_key, id="wrong-bar-ticker-key"),
+        pytest.param(
+            lambda context: context.bar_columns.append("amount"),
+            id="extra-bar-column",
+        ),
+        pytest.param(
+            lambda context: context.bar_indexes.__setitem__(0, "20260811100300"),
+            id="unclosed-bar",
+        ),
+        pytest.param(
+            lambda context: context.bar_rows[0].__setitem__(4, 1.5),
+            id="fractional-bar-volume",
+        ),
+        pytest.param(
+            lambda context: context.bar_rows[0].__setitem__(4, 1 << 53),
+            id="two-to-53-bar-volume",
+        ),
+        pytest.param(
+            lambda context: context.bar_rows[0].__setitem__(4, (1 << 53) + 1),
+            id="two-to-53-plus-one-bar-volume",
+        ),
+        pytest.param(
+            lambda context: context.bar_rows[0].__setitem__(1, 12.2),
+            id="invalid-bar-high",
+        ),
     ],
 )
 def test_big_qmt_helper_market_probe_fails_closed_without_required_source_facts(mutation):
@@ -466,13 +611,13 @@ def test_big_qmt_helper_market_probe_redacts_read_exceptions(caplog):
     assert sensitive_marker not in caplog.text
 
 
-def test_runtime_market_probe_capability_requires_successful_observation():
+def test_runtime_market_probe_capability_is_ready_before_first_probe():
     helper = _load_helper()
     runtime = helper._GatewayRuntime()
     runtime.context_info = _MarketProbeContext()
     runtime.direct_dispatch = True
 
-    assert runtime.health()["qmt_apis"]["market_probe"] is False
+    assert runtime.health()["qmt_apis"]["market_probe"] is True
 
     response = runtime.submit(
         "market_probe",
@@ -483,7 +628,7 @@ def test_runtime_market_probe_capability_requires_successful_observation():
     assert runtime.health()["qmt_apis"]["market_probe"] is True
 
 
-def test_runtime_market_probe_failure_does_not_claim_capability():
+def test_runtime_market_probe_source_failure_does_not_hide_implemented_capability():
     helper = _load_helper()
     context = _MarketProbeContext()
     context.tick.pop("volume")
@@ -497,6 +642,20 @@ def test_runtime_market_probe_failure_does_not_claim_capability():
     )
 
     assert response["ok"] is False
+    assert runtime.health()["qmt_apis"]["market_probe"] is True
+
+
+@pytest.mark.parametrize(
+    "missing_api",
+    ["get_full_tick", "get_market_data_ex", "get_instrument_detail"],
+)
+def test_runtime_market_probe_capability_fails_closed_without_required_api(missing_api):
+    helper = _load_helper()
+    context = _MarketProbeContext()
+    setattr(context, missing_api, None)
+    runtime = helper._GatewayRuntime()
+    runtime.context_info = context
+
     assert runtime.health()["qmt_apis"]["market_probe"] is False
 
 
@@ -517,6 +676,7 @@ def test_runtime_health_reports_gateway_build_id():
     health = runtime.health()
 
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
+    assert health["qmt_apis"]["market_probe_schema_version"] == 2
 
 
 def test_runtime_reports_context_missing_for_current_tick_without_context():

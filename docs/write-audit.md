@@ -28,13 +28,14 @@ Broker RPCs use an explicit allowlist: `account`, `positions`, `orders`, `trades
 `order_status`, `place_order`, and `cancel_order`. Any other `broker.*` action is
 durably counted as `unknown` and rejected before adapter dispatch.
 
-`data.market_probe` is a strictly read-only market-data RPC. It projects a fixed
-schema from QMT tick and instrument facts and never calls a broker adapter or
-advances any write-audit counter. Missing, ambiguous, or malformed source fields
-cause the probe to fail instead of being replaced with zero or false defaults.
-Health reports this action as degraded until the current Helper runtime has
-returned an actual schema-valid probe; method presence alone is not a capability
-signal.
+`data.market_probe` is a strictly read-only market-data RPC. Schema v2 projects a
+fixed tick plus the latest fully closed raw QMT 1-minute bar and never calls a
+broker adapter or advances any write-audit counter. Missing, ambiguous, or
+malformed source fields cause the probe to fail instead of being replaced with
+zero or false defaults. Health reports this action as ready only when the current
+Helper context exposes every API required by the strict implementation; callers
+can therefore check readiness before sending the first probe. The exact wire and
+source contract is documented in [Market probe v2](market-probe-v2.md).
 
 ## Authenticated receipt
 
