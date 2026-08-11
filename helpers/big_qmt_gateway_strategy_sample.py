@@ -10,22 +10,24 @@
 # bridge. Validate scheduling, thread boundaries and QMT API availability in a
 # simulation environment before production use.
 
+import builtins
+import datetime
+import hashlib
 import json
 import logging
+import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import traceback
-import builtins
-import hashlib
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import tornado.ioloop
 import tornado.web
-
 
 # =========================
 # Operator Configuration
@@ -41,7 +43,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
+GATEWAY_BUILD_ID = "20260811_phase1_market_probe_v2"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -1309,6 +1311,317 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     return {"ticks": _normalize_tick_keys(ticks, context_info), "qmt_codes": qmt_codes, "source": source}
 
 
+_MARKET_PROBE_SCHEMA_VERSION = 2
+_MARKET_PROBE_SECURITY_RE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|XSHG|XSHE)$")
+_MARKET_PROBE_COMPACT_TIMESTAMP_RE = re.compile(r"^[0-9]{14}$")
+_MARKET_PROBE_STIME_RE = re.compile(r"^([0-9]{14})(?:\.[0-9]{1,6})?$")
+_MARKET_PROBE_TIMETAG_RE = re.compile(
+    r"^([0-9]{8})[ T]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]{1,6})?$"
+)
+_MARKET_PROBE_ST_NAME_RE = re.compile(r"^(?:S\*ST|SST|\*ST|ST|PT)", re.IGNORECASE)
+_MARKET_PROBE_KNOWN_OPEN_INT = {1, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 23}
+_MARKET_PROBE_SUSPENDED_OPEN_INT = {1, 16, 17, 20}
+_MARKET_PROBE_BAR_FIELDS = ["open", "high", "low", "close", "volume"]
+_MARKET_PROBE_PRICE_LIMIT = 1_000_000_000_000
+_MARKET_PROBE_VOLUME_MAX = (1 << 53) - 1
+
+
+class MarketProbeSchemaError(ValueError):
+    pass
+
+
+def _market_probe_compact_timestamp(value: Any, field: str) -> str:
+    if field == "time":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise MarketProbeSchemaError("invalid market timestamp")
+        numeric = float(value)
+        if (
+            not math.isfinite(numeric)
+            or not numeric.is_integer()
+            or numeric < 946684800000
+            or numeric > 4102444800000
+        ):
+            raise MarketProbeSchemaError("invalid market timestamp")
+        try:
+            utc_value = datetime.datetime.utcfromtimestamp(numeric / 1000.0)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise MarketProbeSchemaError("invalid market timestamp") from exc
+        compact = (utc_value + datetime.timedelta(hours=8)).strftime("%Y%m%d%H%M%S")
+    elif field == "stime":
+        if not isinstance(value, str):
+            raise MarketProbeSchemaError("invalid market timestamp")
+        match = _MARKET_PROBE_STIME_RE.fullmatch(value.strip())
+        if match is None:
+            raise MarketProbeSchemaError("invalid market timestamp")
+        compact = match.group(1)
+    elif field == "timetag":
+        if not isinstance(value, str):
+            raise MarketProbeSchemaError("invalid market timestamp")
+        match = _MARKET_PROBE_TIMETAG_RE.fullmatch(value.strip())
+        if match is None:
+            raise MarketProbeSchemaError("invalid market timestamp")
+        compact = "".join(match.groups()[:4])
+    else:
+        raise MarketProbeSchemaError("invalid market timestamp")
+    if _MARKET_PROBE_COMPACT_TIMESTAMP_RE.fullmatch(compact) is None:
+        raise MarketProbeSchemaError("invalid market timestamp")
+    try:
+        datetime.datetime.strptime(compact, "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise MarketProbeSchemaError("invalid market timestamp") from exc
+    return compact
+
+
+def _market_probe_timestamp(tick: Dict[str, Any]) -> str:
+    available = [field for field in ("time", "stime", "timetag") if field in tick]
+    if not available:
+        raise MarketProbeSchemaError("missing market timestamp")
+    values = [
+        _market_probe_compact_timestamp(tick[field], field)
+        for field in available
+    ]
+    if len(set(values)) != 1:
+        raise MarketProbeSchemaError("conflicting market timestamps")
+    return values[0]
+
+
+def _market_probe_number(value: Any, *, integral: bool) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MarketProbeSchemaError("invalid market number")
+    if integral:
+        if type(value) is int:
+            if value < 0 or value > _MARKET_PROBE_VOLUME_MAX:
+                raise MarketProbeSchemaError("invalid market number")
+            return value
+        number = float(value)
+        if (
+            not math.isfinite(number)
+            or number < 0
+            or number > _MARKET_PROBE_VOLUME_MAX
+            or not number.is_integer()
+        ):
+            raise MarketProbeSchemaError("invalid market number")
+        return int(number)
+    if type(value) is int:
+        if value < 0 or value > _MARKET_PROBE_PRICE_LIMIT:
+            raise MarketProbeSchemaError("invalid market number")
+        return value
+    number = float(value)
+    if not math.isfinite(number) or number < 0 or number > _MARKET_PROBE_PRICE_LIMIT:
+        raise MarketProbeSchemaError("invalid market number")
+    return number
+
+
+def _market_probe_qmt_security(security: str) -> str:
+    code, suffix = security.rsplit(".", 1)
+    if suffix in ("XSHE", "SZ"):
+        return "%s.SZ" % code
+    if suffix in ("XSHG", "SH"):
+        return "%s.SH" % code
+    raise MarketProbeSchemaError("unsupported market security")
+
+
+def _market_probe_field(tick: Dict[str, Any], field: str, *, integral: bool) -> Any:
+    if field not in tick:
+        raise MarketProbeSchemaError("missing market field")
+    return _market_probe_number(tick[field], integral=integral)
+
+
+def _market_probe_level(tick: Dict[str, Any], field: str, *, integral: bool) -> Any:
+    values = tick.get(field)
+    if not isinstance(values, list) or not values:
+        raise MarketProbeSchemaError("invalid market level")
+    return _market_probe_number(values[0], integral=integral)
+
+
+def _market_probe_instrument_info(
+    context_info: Any,
+    qmt_security: str,
+) -> Dict[str, Any]:
+    getter = getattr(context_info, "get_instrument_detail", None)
+    if getter is None:
+        getter = getattr(context_info, "get_instrumentdetail", None)
+    if not callable(getter):
+        raise MarketProbeSchemaError("instrument detail API unavailable")
+    try:
+        raw_info = getter(qmt_security, True)
+    except TypeError:
+        raw_info = getter(qmt_security)
+    info = _basic_value(raw_info)
+    if not isinstance(info, dict):
+        raise MarketProbeSchemaError("invalid instrument detail")
+    return info
+
+
+def _market_probe_suspended(tick: Dict[str, Any], info: Dict[str, Any]) -> bool:
+    open_int = tick.get("openInt")
+    if type(open_int) is not int or open_int not in _MARKET_PROBE_KNOWN_OPEN_INT:
+        raise MarketProbeSchemaError("invalid security status")
+    instrument_status = info.get("InstrumentStatus")
+    if type(instrument_status) is not int:
+        raise MarketProbeSchemaError("invalid instrument status")
+    return instrument_status >= 1 or open_int in _MARKET_PROBE_SUSPENDED_OPEN_INT
+
+
+def _market_probe_is_st(info: Dict[str, Any]) -> bool:
+    instrument_name = info.get("InstrumentName")
+    if not isinstance(instrument_name, str) or not instrument_name.strip():
+        raise MarketProbeSchemaError("invalid instrument name")
+    normalized_name = "".join(instrument_name.strip().upper().split())
+    return _MARKET_PROBE_ST_NAME_RE.match(normalized_name) is not None
+
+
+def _market_probe_capable(context_info: Any) -> bool:
+    if context_info is None:
+        return False
+    instrument_getter = getattr(context_info, "get_instrument_detail", None)
+    if not callable(instrument_getter):
+        instrument_getter = getattr(context_info, "get_instrumentdetail", None)
+    return (
+        callable(getattr(context_info, "get_full_tick", None))
+        and callable(getattr(context_info, "get_market_data_ex", None))
+        and callable(instrument_getter)
+    )
+
+
+def _market_probe_bar_timestamp(value: Any, tick_timestamp: str) -> str:
+    if type(value) is not str or _MARKET_PROBE_COMPACT_TIMESTAMP_RE.fullmatch(value) is None:
+        raise MarketProbeSchemaError("invalid minute bar timestamp")
+    try:
+        source_end = datetime.datetime.strptime(value, "%Y%m%d%H%M%S")
+        tick_time = datetime.datetime.strptime(tick_timestamp, "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise MarketProbeSchemaError("invalid minute bar timestamp") from exc
+    if source_end.second != 0 or source_end > tick_time.replace(second=0, microsecond=0):
+        raise MarketProbeSchemaError("minute bar is not fully closed")
+    endpoint = source_end.time()
+    if not (
+        datetime.time(9, 31) <= endpoint <= datetime.time(11, 30)
+        or datetime.time(13, 1) <= endpoint <= datetime.time(15, 0)
+    ):
+        raise MarketProbeSchemaError("invalid minute bar session")
+    # QMT native 1m indexes are bar end labels.  The wire contract uses the
+    # Shanghai start label so it matches the compared provider unambiguously.
+    return (source_end - datetime.timedelta(minutes=1)).strftime("%Y%m%d%H%M%S")
+
+
+def _market_probe_minute_bar(
+    context_info: Any,
+    qmt_security: str,
+    tick_timestamp: str,
+) -> Dict[str, Any]:
+    getter = getattr(context_info, "get_market_data_ex", None)
+    if not callable(getter):
+        raise MarketProbeSchemaError("market data API unavailable")
+    end_time = tick_timestamp[:12] + "00"
+    raw = getter(
+        list(_MARKET_PROBE_BAR_FIELDS),
+        [qmt_security],
+        period="1m",
+        start_time="",
+        end_time=end_time,
+        count=1,
+        dividend_type="none",
+        fill_data=False,
+        subscribe=False,
+    )
+    if type(raw) is not dict or set(raw) != {qmt_security}:
+        raise MarketProbeSchemaError("invalid minute bar response")
+    frame = raw[qmt_security]
+    try:
+        columns = list(frame.columns)
+        indexes = list(frame.index.tolist())
+        rows = list(frame.values.tolist())
+    except Exception as exc:
+        raise MarketProbeSchemaError("invalid minute bar frame") from exc
+    if columns != _MARKET_PROBE_BAR_FIELDS or len(indexes) != 1 or len(rows) != 1:
+        raise MarketProbeSchemaError("invalid minute bar frame")
+    row = list(rows[0]) if isinstance(rows[0], (list, tuple)) else []
+    if len(row) != len(_MARKET_PROBE_BAR_FIELDS):
+        raise MarketProbeSchemaError("invalid minute bar row")
+    values = [_basic_value(item) for item in row]
+    prices = [
+        _market_probe_number(values[index], integral=False)
+        for index in range(4)
+    ]
+    if prices[1] < max(prices[0], prices[3]) or prices[2] > min(prices[0], prices[3]):
+        raise MarketProbeSchemaError("invalid minute bar prices")
+    return {
+        "timestamp": _market_probe_bar_timestamp(indexes[0], tick_timestamp),
+        "open": prices[0],
+        "high": prices[1],
+        "low": prices[2],
+        "close": prices[3],
+        # QMT's raw 1m volume is in lots (hands).  Preserve it exactly: this
+        # strict probe intentionally does not apply history's compatibility *100.
+        "volume": _market_probe_number(values[4], integral=True),
+    }
+
+
+def _query_market_probe(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    request_id = payload.get("request_id")
+    security = payload.get("security")
+    if (
+        type(security) is not str
+        or _MARKET_PROBE_SECURITY_RE.fullmatch(security) is None
+        or not set(payload).issubset({"security", "request_id"})
+    ):
+        return _error(
+            "MARKET_PROBE_BAD_REQUEST",
+            "market probe requires one supported security",
+            request_id,
+        )
+    if context_info is None:
+        return _context_not_ready(payload)
+    qmt_security = _market_probe_qmt_security(security)
+    try:
+        raw_ticks = context_info.get_full_tick(stock_code=[qmt_security])
+        if not isinstance(raw_ticks, dict) or set(raw_ticks) != {qmt_security}:
+            raise MarketProbeSchemaError("invalid full tick response")
+        tick = _basic_value(raw_ticks[qmt_security])
+        if not isinstance(tick, dict):
+            raise MarketProbeSchemaError("invalid full tick")
+        info = _market_probe_instrument_info(context_info, qmt_security)
+        tick_timestamp = _market_probe_timestamp(tick)
+        result = {
+            "schema_version": _MARKET_PROBE_SCHEMA_VERSION,
+            "security": security,
+            "tick": {
+                "timestamp": tick_timestamp,
+                "last_price": _market_probe_field(tick, "lastPrice", integral=False),
+                "volume": _market_probe_field(tick, "volume", integral=True),
+                "previous_close": _market_probe_field(
+                    tick,
+                    "lastClose",
+                    integral=False,
+                ),
+                "bid1_price": _market_probe_level(tick, "bidPrice", integral=False),
+                "bid1_volume": _market_probe_level(tick, "bidVol", integral=True),
+                "ask1_price": _market_probe_level(tick, "askPrice", integral=False),
+                "ask1_volume": _market_probe_level(tick, "askVol", integral=True),
+                "suspended": _market_probe_suspended(tick, info),
+                "is_st": _market_probe_is_st(info),
+            },
+            "minute_bar": _market_probe_minute_bar(
+                context_info,
+                qmt_security,
+                tick_timestamp,
+            ),
+        }
+        return _ok(result, request_id)
+    except MarketProbeSchemaError:
+        return _error(
+            "MARKET_PROBE_SCHEMA_INVALID",
+            "market probe source data is incomplete or invalid",
+            request_id,
+        )
+    except QmtApiUnavailable:
+        return _error("QMT_API_NOT_READY", "market probe QMT API is unavailable", request_id)
+    except Exception as exc:
+        LOGGER.warning("market_probe read failed type=%s", type(exc).__name__)
+        return _error("MARKET_PROBE_READ_FAILED", "market probe QMT read failed", request_id)
+
+
 def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     downloader = _qmt_global("download_history_data")
     incrementally = payload.get("incrementally")
@@ -2317,6 +2630,8 @@ def _query_trade_detail_debug(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _dispatch_qmt_action(context_info: Any, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     request_id = payload.get("request_id")
+    if action == "market_probe":
+        return _query_market_probe(context_info, payload)
     if action in ("snapshot", "current_tick", "live_current"):
         value = _get_full_tick(context_info, payload)
         if value.get("ok") is False and value.get("code"):
@@ -2526,6 +2841,8 @@ class _GatewayRuntime:
                 "passorder": _qmt_global_available("passorder"),
                 "cancel": _qmt_global_available("cancel"),
                 "can_cancel_order": _qmt_global_available("can_cancel_order"),
+                "market_probe": _market_probe_capable(self.context_info),
+                "market_probe_schema_version": _MARKET_PROBE_SCHEMA_VERSION,
             },
             "backend_type": "big_qmt",
             "strategy": "bt_big_qmt_gateway",
@@ -2664,6 +2981,7 @@ class _GatewayHandler(tornado.web.RequestHandler):
 def _route_to_action(route: str, payload: Dict[str, Any]) -> Optional[str]:
     mapping = {
         "/data/history": "history",
+        "/data/market_probe": "market_probe",
         "/data/snapshot": "snapshot",
         "/data/current_tick": "current_tick",
         "/data/live_current": "live_current",

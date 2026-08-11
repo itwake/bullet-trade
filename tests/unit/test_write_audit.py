@@ -47,6 +47,38 @@ class _BrokerAdapter:
         return {"value": True}
 
 
+class _MarketProbeDataAdapter:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def get_market_probe(self, payload) -> Dict[str, Any]:
+        self.calls.append(dict(payload))
+        return {
+            "schema_version": 2,
+            "security": payload["security"],
+            "tick": {
+                "timestamp": "20260811100220",
+                "last_price": 12.3,
+                "volume": 1234,
+                "previous_close": 12.0,
+                "bid1_price": 12.29,
+                "bid1_volume": 100,
+                "ask1_price": 12.31,
+                "ask1_volume": 200,
+                "suspended": False,
+                "is_st": False,
+            },
+            "minute_bar": {
+                "timestamp": "20260811100100",
+                "open": 12.1,
+                "high": 12.4,
+                "low": 12.0,
+                "close": 12.3,
+                "volume": 321,
+            },
+        }
+
+
 def _app(path: str) -> Tuple[ServerApplication, _BrokerAdapter]:
     broker = _BrokerAdapter()
     config = ServerConfig(token="token", write_audit_db_path=path)
@@ -247,6 +279,33 @@ async def test_direct_handle_audits_writes_and_unknown_before_dispatch(tmp_path:
     assert app.write_audit is not None
     envelope = app.write_audit.receipt("token", "direct-handle-nonce-001")
     assert envelope["receipt"]["counters"] == {"place": 1, "cancel": 1, "unknown": 1}
+    app.write_audit.close()
+
+
+@pytest.mark.asyncio
+async def test_data_market_probe_never_advances_write_audit_counters(tmp_path: Path) -> None:
+    app, broker = _app(str(tmp_path / "audit.sqlite3"))
+    data = _MarketProbeDataAdapter()
+    app.adapters.data_adapter = data
+    assert app.write_audit is not None
+    before = app.write_audit.receipt("token", "market-probe-before-0001")["receipt"]
+
+    response = await app.handle_request(
+        _session(),
+        "data.market_probe",
+        {"security": "000001.XSHE"},
+    )
+
+    after = app.write_audit.receipt("token", "market-probe-after-00001")["receipt"]
+    assert response["schema_version"] == 2
+    assert data.calls == [{"security": "000001.XSHE"}]
+    assert broker.calls == []
+    assert before["global_seq"] == after["global_seq"] == 0
+    assert before["counters"] == after["counters"] == {
+        "place": 0,
+        "cancel": 0,
+        "unknown": 0,
+    }
     app.write_audit.close()
 
 

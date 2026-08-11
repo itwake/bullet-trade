@@ -53,6 +53,9 @@ class RemoteDataAdapter(Protocol):
     async def get_snapshot(self, payload: Dict) -> Dict:
         ...
 
+    async def get_market_probe(self, payload: Dict) -> Dict:
+        ...
+
     async def get_trade_days(self, payload: Dict) -> Dict:
         ...
 
