@@ -174,6 +174,80 @@ async def test_server_dispatches_data_current_tick_with_payload():
 
 
 @pytest.mark.asyncio
+async def test_big_qmt_snapshot_batch_returns_all_ticks_without_narrowing():
+    client = _FakeGatewayClient(
+        {
+            "/data/snapshot": {
+                "ticks": {
+                    "000001.XSHE": {
+                        "lastPrice": 12.3,
+                        "lastClose": 12.0,
+                        "volume": 123456,
+                        "amount": 1518000.5,
+                        "time": 1783043331000,
+                    },
+                    "600000.XSHG": {
+                        "lastPrice": 8.8,
+                        "lastClose": 8.7,
+                        "volume": 654321,
+                        "amount": 5757000.0,
+                        "time": 1783043331000,
+                    },
+                    "999999.XSHG": "not-a-tick",
+                },
+            },
+        }
+    )
+    adapter = BigQmtDataAdapter(client)
+
+    batch = await adapter.get_snapshot_batch(
+        {"securities": ["000001.XSHE", "600000.XSHG", "999999.XSHG"]}
+    )
+
+    assert batch["dtype"] == "dict"
+    assert batch["value"]["count"] == 2
+    ticks = batch["value"]["ticks"]
+    assert set(ticks) == {"000001.XSHE", "600000.XSHG"}
+    assert ticks["000001.XSHE"]["volume"] == 123456
+    assert ticks["000001.XSHE"]["amount"] == 1518000.5
+    assert ticks["600000.XSHG"]["lastClose"] == 8.7
+    assert client.calls == [
+        (
+            "POST",
+            "/data/snapshot",
+            {"securities": ["000001.XSHE", "600000.XSHG", "999999.XSHG"]},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_snapshot_batch_rejects_empty_security_list():
+    adapter = BigQmtDataAdapter(_FakeGatewayClient({}))
+
+    with pytest.raises(ValueError):
+        await adapter.get_snapshot_batch({"securities": []})
+
+
+@pytest.mark.asyncio
+async def test_server_dispatches_data_snapshot_batch():
+    client = _FakeGatewayClient(
+        {
+            "/data/snapshot": {
+                "ticks": {"000001.XSHE": {"lastPrice": 12.3, "volume": 100}},
+            },
+        }
+    )
+    config = _server_config(enable_broker=False)
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtDataAdapter(client)
+    app = ServerApplication(config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None))
+
+    batch = await app._dispatch_data("snapshot_batch", {"securities": ["000001.XSHE"]})
+
+    assert batch["value"]["ticks"]["000001.XSHE"]["volume"] == 100
+
+
+@pytest.mark.asyncio
 async def test_big_qmt_trade_days_accepts_multiple_gateway_date_formats():
     client = _FakeGatewayClient(
         {
