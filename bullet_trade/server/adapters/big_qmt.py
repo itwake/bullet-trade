@@ -27,6 +27,7 @@ from .qmt import dataframe_to_payload, dict_payload
 _DATA_ACTIONS = (
     "data.history",
     "data.snapshot",
+    "data.snapshot_batch",
     "data.current_tick",
     "data.live_current",
     "data.trade_days",
@@ -286,6 +287,35 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         security = payload.get("security")
         data = await self.client.post_first(("/data/snapshot", "/data/current_tick"), payload)
         return _normalize_snapshot_tick(_select_tick(data, security), security)
+
+    async def get_snapshot_batch(self, payload: Dict) -> Dict:
+        """一次调用返回整个列表的最新 tick，供全市场初筛使用。
+
+        网关的 /data/snapshot 端点本身就支持 securities 列表（内部走
+        ContextInfo.get_full_tick），这里不做 _select_tick 收窄，按证券代码
+        原样透传网关补全后的 tick 字段。
+        """
+
+        securities = [
+            str(item).strip()
+            for item in (payload.get("securities") or payload.get("symbols") or [])
+            if str(item).strip()
+        ]
+        if not securities:
+            raise ValueError("securities 不能为空")
+        data = await self.client.post_first(
+            ("/data/snapshot", "/data/current_tick"),
+            {"securities": securities},
+        )
+        if isinstance(data, dict) and "value" in data and isinstance(data["value"], dict):
+            data = data["value"]
+        raw = data.get("ticks") if isinstance(data, dict) else None
+        ticks: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    ticks[str(key)] = dict(value)
+        return {"dtype": "dict", "value": {"ticks": ticks, "count": len(ticks)}}
 
     async def get_live_current(self, payload: Dict) -> Dict:
         security = payload.get("security")
